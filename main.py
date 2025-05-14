@@ -2,7 +2,8 @@ from fastapi import FastAPI, Depends, HTTPException
 import httpx
 import os
 from dotenv import load_dotenv
-
+from auth import router as auth_router
+from fastapi.middleware.cors import CORSMiddleware
 # Load environment variables
 load_dotenv()
 
@@ -18,6 +19,16 @@ app = FastAPI(
     description="Proxy endpoint for Guesty listings",
     version="0.1.0",
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Svelte frontend
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(auth_router)
 
 async def get_guesty_token() -> str:
     """
@@ -44,6 +55,7 @@ async def get_guesty_token() -> str:
 @app.get("/")
 async def welcome():
     return "Hello, welcome to the Propolis Backend"
+
 @app.get("/guesty/listings")
 async def list_guesty_listings(token: str = Depends(get_guesty_token)):
     """
