@@ -1,1 +1,10 @@
 # propolis-backend
+
+## Env Configuration
+
+GUESTY_SECRET=
+GUESTY_CLIENT_ID=
+
+SUPABASE_URL=
+SUPABASE_KEY=
+SECRET_KEY=
