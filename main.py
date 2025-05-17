@@ -57,7 +57,7 @@ async def get_guesty_token() -> str:
 async def welcome():
     return "Hello, welcome to the Propolis Backend"
 
-@app.get("/guesty/listings")
+@app.get("/api/guesty/listings")
 async def list_guesty_listings(token: str = Depends(get_guesty_token)):
     """
     Fetch all listings from Guesty and return the raw JSON.
@@ -77,7 +77,7 @@ async def list_guesty_listings(token: str = Depends(get_guesty_token)):
 
     return resp.json()
 
-@app.get("/guesty/users")
+@app.get("/api/guesty/users")
 async def list_guesty_users(token: str = Depends(get_guesty_token)):
     """
     Fetch all users from Guesty and return the raw JSON.
