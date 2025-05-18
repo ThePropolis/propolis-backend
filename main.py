@@ -3,6 +3,7 @@ import httpx
 import os
 from dotenv import load_dotenv
 from auth import router as auth_router
+from reservations import router as reservation_router
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta, timezone
 
@@ -28,7 +29,7 @@ app.add_middleware(
 )
 
 app.include_router(auth_router)
-
+app.include_router(reservation_router)
 # Module‐level cache
 _token_cache = {
     "access_token": None,
@@ -62,7 +63,7 @@ async def get_guesty_token() -> str:
 
     body = resp.json()
     access_token = body.get("access_token")
-    expires_in = body.get("expires_in", 3600)  # seconds
+    expires_in = body.get("expires_in", 7200)  # seconds
 
     if not access_token:
         raise HTTPException(status_code=502, detail="No access_token in Guesty response")
@@ -79,6 +80,22 @@ async def welcome():
 @app.get("/api/guesty/listings")
 async def list_guesty_listings(token: str = Depends(get_guesty_token)):
     listings_url = "https://open-api.guesty.com/v1/listings"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "accept":        "application/json",
+    }
+    params = {"limit": 100}
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(listings_url, headers=headers, params=params)
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail="Failed to fetch listings") from e
+    return resp.json()
+
+@app.get("/api/guesty/reservations")
+async def list_guesty_listings(token: str = Depends(get_guesty_token)):
+    listings_url = "https://open-api.guesty.com/v1/reservations"
     headers = {
         "Authorization": f"Bearer {token}",
         "accept":        "application/json",
