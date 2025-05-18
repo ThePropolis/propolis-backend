@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from auth import router as auth_router
 from reservations import router as reservation_router
 from scraper.listings import router as listing_router
+from properties import router as property_router
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta, timezone
 import logging
@@ -40,11 +41,8 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(reservation_router)
 app.include_router(listing_router)
-# Module‐level cache
-_token_cache = {
-    "access_token": None,
-    "expires_at": datetime.min.replace(tzinfo=timezone.utc)
-} 
+app.include_router(property_router)
+
 
 
 @app.get("/")

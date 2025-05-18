@@ -3,7 +3,7 @@
 from datetime import datetime
 import os
 from fastapi import APIRouter, FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Dict, List, Any, Optional
 from database import supabase
 
@@ -48,6 +48,10 @@ class Reservation(ReservationGraphData):
     guest_count: Optional[int]
     confirmedAt: Optional[datetime]
     guesty_updated_at: Optional[datetime]
+
+
+
+
 
 @router.get(
     "/api/reservations/",
