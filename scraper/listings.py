@@ -74,15 +74,6 @@ def process_related_data(listings: List[Dict[str, Any]]) -> None:
     if pics:
         supabase.from_("jd_listing_pictures").upsert(pics).execute()
 
-    # Amenities
-    amns = []
-    for lst in listings:
-        lid = lst["_id"]
-        for amenity in lst.get("amenities", []):
-            amns.append({"listing_id": lid, "amenity": amenity})
-    if amns:
-        supabase.from_("jd_listing_amenities").upsert(amns).execute()
-
     # Integrations
     ints = []
     for lst in listings:
@@ -116,6 +107,10 @@ def normalize_guesty_record(raw: Dict[str, Any]) -> Dict[str, Any]:
     
     # Extract terms
     terms = raw.get("terms", {})
+
+    amenities = []
+    for amenity in raw.get("amenities", []):
+        amenities.append(amenity)
     
     return {
         # Primary ID
@@ -139,6 +134,7 @@ def normalize_guesty_record(raw: Dict[str, Any]) -> Dict[str, Any]:
         "bathrooms": raw.get("bathrooms", 0),
         "area_square_feet": raw.get("areaSquareFeet", 0),
         "minimum_age": raw.get("minimumAge"),
+        "amenities": amenities,
         
         # Cleaning Status
         "cleaning_status": cleaning_status_value,
