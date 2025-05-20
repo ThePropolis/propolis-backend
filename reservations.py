@@ -61,7 +61,7 @@ def get_reservations(
     date_end: Optional[str] = Query(None, description="end date of filter"),
     number_of_beds: Optional[List[int]] = Query(None, description="number of beds to filter on"),
     property_type: Optional[str] = Query(None, description="filter on co-living or entire unit"),
-    property_full_name: List[str] = Query(None, description="Full name of the property")
+    property_full_name: str = Query(None, description="Full name of the property")
 ) -> List[ReservationGraphData]:
     # Step 1: Get filtered listings
     listing_query = supabase.from_("jd_listing").select("id, bedrooms, property_type") 
@@ -84,13 +84,13 @@ def get_reservations(
     reservation_query = (
         supabase
         .from_("reservations")
-        .select("total_paid, guesty_created_at, guesty_listing_id")
+        .select("total_paid, guesty_created_at, guesty_listing_id, property_full_name")
         .filter("total_paid", "neq", 0)
     )
-    # print(listing_ids)
-    print(property_full_name, "")
+    print(listing_ids)
+    print("Filtering by property_full_name =", repr(property_full_name))
     if property_full_name:
-        listing_query = reservation_query.filter("property_full_name", "eq", property_full_name)
+        reservation_query = reservation_query.eq("property_full_name", property_full_name)
     if date_start:
         reservation_query = reservation_query.gte("guesty_created_at", date_start)
     if date_end:
@@ -98,7 +98,7 @@ def get_reservations(
         
     reservations_response = reservation_query.execute()
     reservations = reservations_response.data or []
-    
+    print(reservations)
     # Step 3: Join the data and return proper model instances
     result = []
     for r in reservations:
@@ -107,10 +107,8 @@ def get_reservations(
             result.append(ReservationGraphData(
                 total_paid=r["total_paid"],
                 guesty_created_at=r["guesty_created_at"],
-                bedrooms=listing.get("bedrooms"),
-                property_type=listing.get("property_type"),
-                listing_id=r["guesty_listing_id"]
             ))
+    # print(result)
     return result
 
 
