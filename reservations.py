@@ -51,29 +51,70 @@ class Reservation(ReservationGraphData):
 
 
 
-
-
 @router.get(
     "/api/reservations/",
     response_model=List[ReservationGraphData],
-    summary="Get reservations for a property with non-zero total_paid"
+    summary="Get reservations with specific filters"
 )
 def get_reservations(
-    property_full_name: str = Query(..., description="Full name of the property")
-) -> List[Dict]:
-    res = (
+    date_start: Optional[str] = Query(None, description="start date of filter"),
+    date_end: Optional[str] = Query(None, description="end date of filter"),
+    number_of_beds: Optional[List[int]] = Query(None, description="number of beds to filter on"),
+    property_type: Optional[str] = Query(None, description="filter on co-living or entire unit"),
+    property_full_name: Optional[str] = Query(None, description="Full name of the property")
+) -> List[ReservationGraphData]:
+    # Step 1: Get filtered listings
+    listing_query = supabase.from_("jd_listing").select("id, bedrooms, property_type") 
+    if property_type:
+        listing_query = listing_query.eq("property_type", property_type)
+    if number_of_beds:
+        listing_query = listing_query.in_("bedrooms", number_of_beds)
+    listings_response = listing_query.execute()
+    listings = listings_response.data or []
+    
+    # Create a mapping of listing_id to listing details
+    listing_map = {l["id"]: l for l in listings}
+    listing_ids = list(listing_map.keys())
+    
+    # If no listings match the criteria, return empty result
+    if not listing_ids:
+        return []
+    
+    # Step 2: Get reservations only for the filtered listings
+    reservation_query = (
         supabase
-        .table("reservations")
-        .select("total_paid, guesty_created_at")
-        .filter("property_full_name", "eq", property_full_name)
+        .from_("reservations")
+        .select("total_paid, guesty_created_at, guesty_listing_id")
         .filter("total_paid", "neq", 0)
-        .order("guesty_created_at")  # optional: sort by date
-        .execute()
     )
+    # print(listing_ids)
+    print(property_full_name, "")
+    if property_full_name:
+        listing_query = reservation_query.filter("property_full_name", "eq", property_full_name)
+    if date_start:
+        reservation_query = reservation_query.gte("guesty_created_at", date_start)
+    if date_end:
+        reservation_query = reservation_query.lte("guesty_created_at", date_end)
+        
+    reservations_response = reservation_query.execute()
+    reservations = reservations_response.data or []
+    
+    # Step 3: Join the data and return proper model instances
+    result = []
+    for r in reservations:
+        listing = listing_map.get(r["guesty_listing_id"])
+        if listing:  # This check is probably redundant now due to the in_() filter
+            result.append(ReservationGraphData(
+                total_paid=r["total_paid"],
+                guesty_created_at=r["guesty_created_at"],
+                bedrooms=listing.get("bedrooms"),
+                property_type=listing.get("property_type"),
+                listing_id=r["guesty_listing_id"]
+            ))
+    return result
 
-   
 
-    return res.data or []
+
 
 
 @router.get(
@@ -81,15 +122,20 @@ def get_reservations(
     response_model=List[str],
     summary="Get reservations names"
 )
+@router.get(
+    "/api/reservations/names",
+    response_model=List[str],
+    summary="Get reservations names"
+)
 def get_property_names():
-    # Run the Supabase query
+    # Use from_() instead of table() to be consistent
     res = (
         supabase
-        .table("reservations")
+        .from_("reservations")
         .select("property_full_name")
-        .execute() 
+        .execute()
     )
-
-
-    return list(set([item["property_full_name"] for item in res.data]))
-
+    
+    # Filter out None values and create a set of unique names
+    property_names = [item["property_full_name"] for item in res.data if item.get("property_full_name")]
+    return list(set(property_names))

@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException
 import httpx
 import os
 from dotenv import load_dotenv
+
 from auth import router as auth_router
 from reservations import router as reservation_router
 from scraper.listings import router as listing_router
@@ -45,12 +46,15 @@ app.include_router(property_router)
 
 
 
+
+    
 @app.get("/")
 async def welcome():
     return "Hello, welcome to the Propolis Backend"
 
 @app.get("/api/guesty/listings")
 async def list_guesty_listings(token: str = Depends(token.get_guesty_token)):
+
     listings_url = "https://open-api.guesty.com/v1/listings"
     headers = {
         "Authorization": f"Bearer {token}",

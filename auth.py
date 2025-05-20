@@ -82,3 +82,12 @@ async def get_current_user(request: Request):
         
     except JWTError as e:
         raise HTTPException(status_code=401, detail="Invalid token") from e
+
+
+@router.post("/api/auth/username")
+async def update_username():
+    response = supabase.auth.update_user({
+    "data": {
+        "full_name": "Misha Gurevich"
+    }})
+    return response
