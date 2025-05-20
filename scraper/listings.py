@@ -111,7 +111,8 @@ def normalize_guesty_record(raw: Dict[str, Any]) -> Dict[str, Any]:
     amenities = []
     for amenity in raw.get("amenities", []):
         amenities.append(amenity)
-    
+    # print(raw) 
+    print(raw)
     return {
         # Primary ID
         "id": raw["_id"],
@@ -125,6 +126,7 @@ def normalize_guesty_record(raw: Dict[str, Any]) -> Dict[str, Any]:
         "title": raw.get("title", ""),
         "nickname": raw.get("nickname", ""),
         "active": raw.get("active", True),  # Add active status
+        
         
         # Property Details
         "property_type": raw.get("propertyType", ""),
@@ -141,7 +143,6 @@ def normalize_guesty_record(raw: Dict[str, Any]) -> Dict[str, Any]:
         
         # Address
         "address_full": address.get("full", ""),
-        "address_building_name": address.get("buildingName", ""),
         "address_city": address.get("city", ""),
         "address_state": address.get("state", ""),
         "address_neighborhood": address.get("neighborhood", ""),

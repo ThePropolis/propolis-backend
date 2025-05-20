@@ -61,10 +61,12 @@ def get_reservations(
     date_end: Optional[str] = Query(None, description="end date of filter"),
     number_of_beds: Optional[List[int]] = Query(None, description="number of beds to filter on"),
     property_type: Optional[str] = Query(None, description="filter on co-living or entire unit"),
+    building_name: Optional[str] = Query(None, description="The property name"),
     property_full_name: str = Query(None, description="Full name of the property")
 ) -> List[ReservationGraphData]:
     # Step 1: Get filtered listings
     listing_query = supabase.from_("jd_listing").select("id, bedrooms, property_type") 
+    
     if property_type:
         listing_query = listing_query.eq("property_type", property_type)
     if number_of_beds:
@@ -87,8 +89,11 @@ def get_reservations(
         .select("total_paid, guesty_created_at, guesty_listing_id, property_full_name")
         .filter("total_paid", "neq", 0)
     )
-    print(listing_ids)
+    # print(listing_ids)
     print("Filtering by property_full_name =", repr(property_full_name))
+
+    if building_name:
+        reservation_query = reservation_query.eq("property_name", building_name)
     if property_full_name:
         reservation_query = reservation_query.eq("property_full_name", property_full_name)
     if date_start:
@@ -115,11 +120,7 @@ def get_reservations(
 
 
 
-@router.get(
-    "/api/reservations/names",
-    response_model=List[str],
-    summary="Get reservations names"
-)
+
 @router.get(
     "/api/reservations/names",
     response_model=List[str],
@@ -130,10 +131,10 @@ def get_property_names():
     res = (
         supabase
         .from_("reservations")
-        .select("property_full_name")
+        .select("property_name")
         .execute()
     )
     
     # Filter out None values and create a set of unique names
-    property_names = [item["property_full_name"] for item in res.data if item.get("property_full_name")]
+    property_names = [item["property_name"] for item in res.data if item.get("property_name")]
     return list(set(property_names))
