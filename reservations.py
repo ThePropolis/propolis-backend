@@ -61,7 +61,7 @@ def get_reservations(
     date_end: Optional[str] = Query(None, description="end date of filter"),
     number_of_beds: Optional[List[int]] = Query(None, description="number of beds to filter on"),
     property_type: Optional[str] = Query(None, description="filter on co-living or entire unit"),
-    property_full_name: Optional[str] = Query(None, description="Full name of the property")
+    property_full_name: List[str] = Query(None, description="Full name of the property")
 ) -> List[ReservationGraphData]:
     # Step 1: Get filtered listings
     listing_query = supabase.from_("jd_listing").select("id, bedrooms, property_type") 
