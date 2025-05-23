@@ -1,7 +1,7 @@
 fastapi==0.109.2
-uvicorn[standard]
+uvicorn[standard]==0.23.2
 httpx==0.26.0
 python-dotenv==1.0.1 
-pyjwt
-supabase
-python-jose
+pyjwt==2.10.1
+supabase==2.15.1
+python-jose==3.4.0
