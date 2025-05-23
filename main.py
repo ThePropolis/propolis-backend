@@ -46,8 +46,7 @@ app.include_router(property_router)
 
 
 
-
-    
+ 
 @app.get("/")
 async def welcome():
     return "Hello, welcome to the Propolis Backend"
