@@ -24,3 +24,7 @@ run:
       value: "production"
     - name: LOG_LEVEL
       value: "info"
+    - name: GUESTY_CLIENT_ID
+      value: "${GUESTY_CLIENT_ID}"
+    - name: GUESTY_SECRET
+      value: "${GUESTY_SECRET}"
