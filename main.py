@@ -1,3 +1,7 @@
+import logging
+logging.basicConfig(level=logging.INFO)
+logging.info("FastAPI app is starting up...")
+
 from fastapi import FastAPI, Depends, HTTPException
 import httpx
 import os
