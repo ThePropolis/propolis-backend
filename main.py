@@ -2,7 +2,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logging.info("FastAPI app is starting up...")
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 import httpx
 import os
 from dotenv import load_dotenv
@@ -34,6 +34,13 @@ app = FastAPI(
     description="Proxy endpoint for Guesty listings",
     version="0.1.0",
 )
+
+
+@app.middleware("http")
+async def log_request_scheme(request: Request, call_next):
+    print(f"🔍 SCHEME: {request.url.scheme} — FULL URL: {request.url}")
+    response = await call_next(request)
+    return response
 
 app.add_middleware(
     CORSMiddleware,
