@@ -96,6 +96,9 @@ def get_reservations(
     # Create a mapping of listing_id to listing details
     listing_map = {l["id"]: l for l in listings}
     listing_ids = list(listing_map.keys())
+
+    if not listing_ids:
+        return []
     
     # Step 2: Get reservations with all applied filters
     reservation_query = (
@@ -131,13 +134,14 @@ def get_reservations(
     result = []
     for r in reservations:
         # If we're not filtering by listing details, or if this listing matches our filters
-        if not listing_ids or r["guesty_listing_id"] in listing_ids:  
+        if r["guesty_listing_id"] in listing_ids:  
             result.append(ReservationGraphData(
                 id=r["id"],
                 total_paid=r["total_paid"],
                 guesty_created_at=r["guesty_created_at"],
                 property_full_name=r.get("property_full_name")  # Include property name for grouping on frontend
             ))
+    print(result)
     return result
 
 
