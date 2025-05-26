@@ -62,26 +62,12 @@ def get_reservations(
     date_end: Optional[str] = Query(None, description="end date of filter"),
     number_of_beds: Optional[int] = Query(None, description="number of beds to filter on"),
     property_type: Optional[str] = Query(None, description="filter on co-living or entire unit"),
-    building_name: Optional[str] = Query(None, description="The property name"),
-    building_names: Optional[List[str]] = Query(None, description="Multiple property names"),
-    property_full_name: Optional[str] = Query(None, description="Full name of the property"),
-    property_full_names: Optional[List[str]] = Query(None, description="Multiple full property names")
+    building_names: Optional[List[str]] = Query(None, description="Property names to filter on"),
+    property_full_names: Optional[List[str]] = Query(None, description="Full property names to filter on")
 ) -> List[ReservationGraphData]:
     """
-    Get reservation data with multiple filtering options, including support for
-    multiple buildings or properties at once.
+    Get reservation data with filtering options.
     """
-    # Log the request parameters for debugging
-    print("Received request with parameters:")
-    print(f"date_start: {date_start}")
-    print(f"date_end: {date_end}")
-    print(f"number_of_beds: {number_of_beds}")
-    print(f"property_type: {property_type}")
-    print(f"building_name: {building_name}")
-    print(f"building_names: {building_names}")
-    print(f"property_full_name: {property_full_name}")
-    print(f"property_full_names: {property_full_names}")
-    
     # Step 1: Get filtered listings
     listing_query = supabase.from_("jd_listing").select("id, bedrooms, property_type") 
     
@@ -89,36 +75,41 @@ def get_reservations(
         listing_query = listing_query.eq("property_type", property_type)
     if number_of_beds:
         listing_query = listing_query.eq("bedrooms", number_of_beds)
+    
     listings_response = listing_query.execute()
     listings = listings_response.data or []
     
-    print(listings)
-    # Create a mapping of listing_id to listing details
     listing_map = {l["id"]: l for l in listings}
     listing_ids = list(listing_map.keys())
-
+   
     if not listing_ids:
         return []
     
-    # Step 2: Get reservations with all applied filters
+    # Step 2: Get reservations with filters
     reservation_query = (
-        supabase
-        .from_("reservations")
-        .select("total_paid, guesty_created_at, guesty_listing_id, property_full_name, property_name, id")
-        .filter("total_paid", "neq", 0)
-    )
+    supabase
+    .from_("reservations")
+    .select("total_paid, guesty_created_at, guesty_listing_id, property_full_name, property_name, id")
+    .filter("total_paid", "neq", 0)
+    .order("guesty_created_at", desc=False)
+)
 
-    # Handle multiple building names
-    if building_names and len(building_names) > 0:
-        reservation_query = reservation_query.in_("property_name", building_names)
-    elif building_name:
-        reservation_query = reservation_query.eq("property_name", building_name)
+# Combine filters with OR logic
+    or_conditions = []
+
+    if building_names:
+        building_names_str = ",".join([f'"{name}"' for name in building_names])
+        or_conditions.append(f"property_name.in.({building_names_str})")
+
+    if property_full_names:
+        property_full_names_str = ",".join([f'"{name}"' for name in property_full_names])
+        or_conditions.append(f"property_full_name.in.({property_full_names_str})")
+
+    if or_conditions:
+        # Join conditions with a comma — this creates an OR query in Supabase
+        reservation_query = reservation_query.or_(",".join(or_conditions))
+
         
-    # Handle multiple property names
-    if property_full_names and len(property_full_names) > 0:
-        reservation_query = reservation_query.in_("property_full_name", property_full_names)
-    elif property_full_name:
-        reservation_query = reservation_query.eq("property_full_name", property_full_name)
         
     # Date filters
     if date_start:
@@ -126,22 +117,24 @@ def get_reservations(
     if date_end:
         reservation_query = reservation_query.lte("guesty_created_at", date_end)
     
-    # Execute the query
     reservations_response = reservation_query.execute()
     reservations = reservations_response.data or []
     
-    # Step 3: Join the data and return with property information included
+    # Step 3: Join and return results
     result = []
     for r in reservations:
-        # If we're not filtering by listing details, or if this listing matches our filters
-        if r["guesty_listing_id"] in listing_ids:  
+        print(r)
+        if r["guesty_listing_id"] in listing_ids and r['guesty_created_at'] != None: 
             result.append(ReservationGraphData(
                 id=r["id"],
                 total_paid=r["total_paid"],
                 guesty_created_at=r["guesty_created_at"],
-                property_full_name=r.get("property_full_name")  # Include property name for grouping on frontend
+                property_full_name=r.get("property_full_name")
             ))
-    print(result)
+
+   
+   
+    
     return result
 
 

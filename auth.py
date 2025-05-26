@@ -21,6 +21,8 @@ class Token(BaseModel):
 
 class User(BaseModel):
     email: str
+    full_name: str
+    role: str
 
 def create_access_token(data: dict):
     to_encode = data.copy()
@@ -28,29 +30,47 @@ def create_access_token(data: dict):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-@router.post("/api/auth/login", response_model=Token)
+# In your login endpoint - store user data in JWT
+@router.post("/api/auth/login")
 async def login(credentials: UserCredentials):
-    # Authenticate with Supabase
     try:
-        auth_response = supabase.auth.sign_in_with_password({
+        # Authenticate with Supabase
+        response = supabase.auth.sign_in_with_password({
             "email": credentials.email,
-            "password": credentials.password,
+            "password": credentials.password
         })
         
-        # Check for errors in the response
-        if hasattr(auth_response, 'error') and auth_response.error:
-            raise HTTPException(status_code=401, detail=auth_response.error.message)
-        
-        # Create JWT with user's ID and email
-        user_id = auth_response.user.id
-        user_email = auth_response.user.email
-        token = create_access_token({"sub": user_email, "user_id": user_id})
-        
-        return {"access_token": token, "token_type": "bearer"}
-    
+        if response.user:
+            # Get user metadata from Supabase response
+            user_metadata = response.user.user_metadata or {}
+            print(user_metadata)
+            # Create JWT with user data included
+            token_data = {
+                "sub": credentials.email,
+                "user_id": response.user.id,
+                "full_name": user_metadata.get("full_name", ""),
+                "role": user_metadata.get("role", "user"),
+                "exp": datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+            }
+            
+            access_token = jwt.encode(token_data, SECRET_KEY, algorithm=ALGORITHM)
+            
+            return {
+                "access_token": access_token,
+                "token_type": "bearer",
+                "user": {
+                    "email": credentials.email,
+                    "full_name": user_metadata.get("full_name", ""),
+                    "role": user_metadata.get("role", "user")
+                }
+            }
+        else:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+            
     except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
+        raise HTTPException(status_code=401, detail="Authentication failed")
 
+# Updated get_current_user - no Supabase calls needed
 @router.get("/api/auth/me", response_model=User)
 async def get_current_user(request: Request):
     token = request.headers.get("Authorization")
@@ -58,36 +78,30 @@ async def get_current_user(request: Request):
         raise HTTPException(status_code=401, detail="Token missing or invalid")
     
     try:
-        # Decode the JWT token
+        # Decode JWT and extract user data
         payload = jwt.decode(token.split(" ")[1], SECRET_KEY, algorithms=[ALGORITHM])
-        email = payload.get("sub")
-        user_id = payload.get("user_id")
         
-        if not email or not user_id:
+        email = payload.get("sub")
+        
+        if not email:
             raise HTTPException(status_code=401, detail="Invalid token")
         
-        # We already have the email from the token, so we don't need to fetch from Supabase
-        # If you need to validate the user still exists:
-        try:
-            # Use get_user_by_id instead of get_user_by_email
-            user = supabase.auth.admin.get_user_by_id(user_id)
-            if not user or hasattr(user, 'error') and user.error:
-                raise HTTPException(status_code=401, detail="User not found")
-        except Exception as e:
-            # If we can't verify with Supabase, we can still return the email from the token
-            # This is a fallback and might be acceptable depending on your security requirements
-            pass
-            
-        return {"email": email}
+        # Return user data directly from JWT
+        return {
+            "email": email,
+            "full_name": payload.get("full_name", ""),
+            "role": payload.get("role", "user")
+        }
         
-    except JWTError as e:
-        raise HTTPException(status_code=401, detail="Invalid token") from e
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 
 @router.post("/api/auth/username")
 async def update_username():
     response = supabase.auth.update_user({
     "data": {
+        "role": "ADMIN",
         "full_name": "Misha Gurevich"
     }})
     return response
