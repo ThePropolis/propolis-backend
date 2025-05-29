@@ -11,6 +11,7 @@ from auth import router as auth_router
 from reservations import router as reservation_router
 from scraper.listings import router as listing_router
 from properties import router as property_router
+from doorloop import router as doorloop_router
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta, timezone
 import logging
@@ -54,6 +55,7 @@ app.include_router(auth_router)
 app.include_router(reservation_router)
 app.include_router(listing_router)
 app.include_router(property_router)
+app.include_router(doorloop_router)
 
 
 
