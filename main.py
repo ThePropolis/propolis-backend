@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 logging.basicConfig(level=logging.INFO)
 logging.info("FastAPI app is starting up...")
 
@@ -217,3 +218,182 @@ async def get_guesty_revenue(
         
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=502, detail="Failed to fetch revenue data") from e
+    
+
+
+@app.get("/occupancy-rate")
+async def get_occupancy_rate(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    token: str = Depends(token.get_guesty_token)
+):
+    """
+    Calculate occupancy rate: (occupied units / total units) * 100
+    
+    Parameters:
+    - date_from: Start date (YYYY-MM-DD) - defaults to current month start
+    - date_to: End date (YYYY-MM-DD) - defaults to current month end
+    """
+    
+    if not token:
+        raise HTTPException(status_code=500, detail="Guesty API token not configured")
+    
+    # Set default date range to current month if not provided
+    if not date_from or not date_to:
+        today = datetime.now()
+        date_from = today.replace(day=1).strftime("%Y-%m-%d")
+        # Last day of current month
+        next_month = today.replace(day=28) + timedelta(days=4)
+        date_to = (next_month - timedelta(days=next_month.day)).strftime("%Y-%m-%d")
+    
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    try:
+        # Get occupied units (properties with confirmed reservations in date range)
+        occupied_units = await get_occupied_units(headers, date_from, date_to)
+        
+        # Get total units (all active properties)
+        total_units = await get_total_units(headers)
+        
+        if total_units == 0:
+            occupancy_rate = 0.0
+        else:
+            occupancy_rate = (occupied_units / total_units) * 100
+        
+        return {
+            "occupancy_rate": round(occupancy_rate, 2),
+            "occupied_units": occupied_units,
+            "total_units": total_units,
+            "date_from": date_from,
+            "date_to": date_to,
+            "message": f"Occupancy rate: {occupancy_rate:.2f}%"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to calculate occupancy: {str(e)}")
+
+async def get_occupied_units(
+        headers: dict, 
+        date_from: str, 
+        date_to: str,
+        token: str = Depends(token.get_guesty_token)
+    ):
+    """
+    Get count of unique properties that have confirmed reservations in the date range
+    """
+    params = {
+        "fields": "listingId",
+        "limit": 100,
+        "sort": "_id"
+    }
+    
+    # Filter for confirmed reservations in date range
+    filters = [
+        {"operator": "$eq", "field": "status", "value": "confirmed"},
+        {"operator": "$between", "field": "checkInDateLocalized", "from": date_from, "to": date_to}
+    ]
+    
+    params["filters"] = str(filters).replace("'", '"')
+    
+    occupied_property_ids = set()
+    skip = 0
+    
+    async with httpx.AsyncClient() as client:
+        while True:
+            params["skip"] = skip
+            
+            response = await client.get(
+                f"https://open-api.guesty.com/v1/reservations",
+                params=params,
+                headers=headers,
+                timeout=30.0
+            )
+            
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Guesty API error: {response.text}"
+                )
+            
+            data = response.json()
+            reservations = data.get("results", [])
+            
+            if not reservations:
+                break
+            
+            # Collect unique property IDs
+            for reservation in reservations:
+                listing_id = reservation.get("listingId")
+                if listing_id:
+                    occupied_property_ids.add(listing_id)
+            
+            if len(reservations) < 100:
+                break
+                
+            skip += 100
+    
+    return len(occupied_property_ids)
+
+async def get_total_units(
+        headers: dict
+    ):
+    """
+    Get total count of active properties/units
+    """
+    params = {
+        "fields": "_id",
+        "filters": '[{"operator": "$eq", "field": "active", "value": true}]',
+        "limit": 100,
+        "sort": "_id"
+    }
+    
+    total_units = 0
+    skip = 0
+    
+    async with httpx.AsyncClient() as client:
+        while True:
+            params["skip"] = skip
+            
+            response = await client.get(
+                f"https://open-api.guesty.com/v1/listings",
+                params=params,
+                headers=headers,
+                timeout=30.0
+            )
+            
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Guesty API error: {response.text}"
+                )
+            
+            data = response.json()
+            listings = data.get("results", [])
+            
+            if not listings:
+                break
+            
+            total_units += len(listings)
+            
+            if len(listings) < 100:
+                break
+                
+            skip += 100
+    
+    return total_units
+
+@app.get("/occupancy-rate/current-month")
+async def get_current_month_occupancy():
+    """Get occupancy rate for current month"""
+    return await get_occupancy_rate()
+
+@app.get("/occupancy-rate/custom")
+async def get_custom_occupancy(date_from: str, date_to: str):
+    """Get occupancy rate for custom date range"""
+    return await get_occupancy_rate(date_from, date_to)
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+

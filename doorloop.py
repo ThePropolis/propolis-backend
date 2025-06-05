@@ -1,4 +1,6 @@
+from datetime import datetime, timedelta
 import logging
+from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends
 import httpx
 import os
@@ -458,90 +460,527 @@ async def get_doorloop_profit_and_loss(
     pl_url = f"{DOORLOOP_BASE_URL}/reports/profit-and-loss-summary"
     headers = get_doorloop_headers()
     
-    # Try different parameter formats that Doorloop might expect
-    params_variations = [
-        # Variation 1: filter_accountingMethod
-        {
-            "filter_accountingMethod": accounting_method
-        },
-        # Variation 2: accountingMethod
-        {
-            "accountingMethod": accounting_method
-        },
-        # Variation 3: accounting_method
-        {
-            "accounting_method": accounting_method
-        },
-        # Variation 4: filter[accountingMethod]
-        {
-            "filter[accountingMethod]": accounting_method
-        }
-    ]
+    # Build query parameters
+    params = {
+        "filter_accountingMethod": accounting_method.upper()
+    }
     
-    # Add date filters to each variation if provided
-    for params in params_variations:
-        if start_date:
-            params.update({
-                "filter_startDate": start_date,
-                "startDate": start_date,
-                "start_date": start_date
-            })
-        if end_date:
-            params.update({
-                "filter_endDate": end_date,
-                "endDate": end_date,
-                "end_date": end_date
-            })
+    # Add date filters if provided
+    if start_date:
+        params["filter_startDate"] = start_date
+    if end_date:
+        params["filter_endDate"] = end_date
+    
+    logger.info(f"Making request to: {pl_url} with params: {params}")
     
     async with httpx.AsyncClient() as client:
-        # Try each parameter variation
-        for i, params in enumerate(params_variations):
+        try:
+            resp = await client.get(pl_url, headers=headers, params=params)
+            resp.raise_for_status()
+            
+            # Check if response has content
+            if not resp.content:
+                logger.warning("Empty response from Doorloop P&L API")
+                return {"message": "No profit and loss data available", "data": []}
+            
+            # Check content type
+            content_type = resp.headers.get("content-type", "")
+            logger.info(f"Response content type: {content_type}")
+            
+            # Check if we got HTML (login page) instead of JSON
+            if "text/html" in content_type:
+                logger.warning("Received HTML response (likely login page)")
+                return {
+                    "message": "Received HTML response (likely login page)",
+                    "content_type": content_type,
+                    "suggestion": "This endpoint may not exist or requires different authentication"
+                }
+            
+            # Try to parse JSON
             try:
-                logger.info(f"Trying parameter variation {i+1}: {params}")
-                resp = await client.get(pl_url, headers=headers, params=params)
+                data = resp.json()
+                logger.info("Successfully fetched profit and loss data from Doorloop")
+                return {
+                    "success": True,
+                    "parameters_used": params,
+                    "data": data
+                }
+            except ValueError as json_error:
+                logger.error(f"Failed to parse JSON response: {json_error}")
+                logger.info(f"Response content: {resp.text[:500]}...")
+                return {
+                    "message": "P&L data received but not in JSON format",
+                    "content_type": content_type,
+                    "raw_response": resp.text[:1000]
+                }
                 
-                if resp.status_code == 200:
-                    content_type = resp.headers.get("content-type", "")
-                    logger.info(f"Success with variation {i+1}! Content type: {content_type}")
-                    
-                    # Check if we got HTML (login page) instead of JSON
-                    if "text/html" in content_type:
-                        logger.warning("Received HTML response (likely login page)")
-                        continue
-                    
-                    # Try to parse JSON
-                    try:
-                        data = resp.json()
-                        logger.info("Successfully fetched profit and loss data from Doorloop")
-                        return {
-                            "success": True,
-                            "parameters_used": params,
-                            "variation_number": i+1,
-                            "data": data
-                        }
-                    except ValueError as json_error:
-                        logger.error(f"Failed to parse JSON response: {json_error}")
-                        continue
-                        
-                elif resp.status_code == 400:
-                    logger.info(f"Variation {i+1} failed with 400: {resp.text}")
-                    continue
-                else:
-                    logger.info(f"Variation {i+1} failed with status {resp.status_code}")
-                    continue
-                    
-            except Exception as e:
-                logger.warning(f"Error with variation {i+1}: {e}")
-                continue
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP Error {e.response.status_code} for P&L: {e.response.text}")
+            if e.response.status_code == 400:
+                # Parse the error message to provide helpful feedback
+                try:
+                    error_data = e.response.json()
+                    return {
+                        "error": "Bad Request - Missing or invalid parameters",
+                        "details": error_data,
+                        "parameters_sent": params,
+                        "suggestion": "Check the error details above for specific parameter issues"
+                    }
+                except:
+                    return {
+                        "error": "Bad Request",
+                        "parameters_sent": params,
+                        "response_text": e.response.text
+                    }
+            raise HTTPException(status_code=502, detail=f"Failed to fetch P&L from Doorloop: {e.response.status_code}") from e
+        except Exception as e:
+            logger.error(f"Unexpected error fetching P&L: {e}")
+            raise HTTPException(status_code=500, detail="Internal server error") from e
+        
+
+@router.get("/occupancy-rate-doorloop")
+async def get_occupancy_rate(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None
+):
+    """
+    Calculate occupancy rate: (occupied units / total units) * 100
     
-    # If all variations failed, return detailed error info
+    Parameters:
+    - date_from: Start date (YYYY-MM-DD) - defaults to current month start
+    - date_to: End date (YYYY-MM-DD) - defaults to current month end
+    """
+    
+    if not DOORLOOP_API_KEY:
+        raise HTTPException(status_code=500, detail="DoorLoop API token not configured")
+    
+    # Set default date range to current month if not provided
+    if not date_from or not date_to:
+        today = datetime.now()
+        date_from = today.replace(day=1).strftime("%Y-%m-%d")
+        next_month = today.replace(day=28) + timedelta(days=4)
+        date_to = (next_month - timedelta(days=next_month.day)).strftime("%Y-%m-%d")
+    
+    headers = get_doorloop_headers()
+    
+    logger.info(f"Calculating occupancy rate from {date_from} to {date_to}")
+    
+    try:
+        # Get total units from properties
+        total_units = await get_total_units(headers)
+        logger.info(f"Found {total_units} total units")
+        
+        # Get occupied units from active leases
+        occupied_units = await get_occupied_units(headers, date_from, date_to)
+        logger.info(f"Found {occupied_units} occupied units")
+        
+        # Calculate occupancy rate
+        if total_units == 0:
+            occupancy_rate = 0
+        else:
+            occupancy_rate = (occupied_units / total_units) * 100
+        
+        return {
+            "occupancy_rate": round(occupancy_rate, 2),
+            "occupied_units": occupied_units,
+            "total_units": total_units,
+            "date_from": date_from,
+            "date_to": date_to,
+            "percentage": f"{round(occupancy_rate, 2)}%"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error calculating occupancy rate: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error calculating occupancy rate: {str(e)}")
+
+async def get_total_units(headers):
+    """Get total number of units from all properties"""
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            # Get all properties
+            logger.info(f"Fetching properties from {DOORLOOP_BASE_URL}/properties")
+            response = await client.get(
+                f"{DOORLOOP_BASE_URL}/properties",
+                headers=headers,
+                params={"limit": 1000}
+            )
+            
+            logger.info(f"Properties response status: {response.status_code}")
+            logger.info(f"Properties response content type: {response.headers.get('content-type', '')}")
+            logger.info(f"Properties response has content: {bool(response.content)}")
+            
+            if response.status_code != 200:
+                logger.error(f"Failed to fetch properties: Status {response.status_code}, Response: {response.text}")
+                raise Exception(f"Failed to fetch properties: Status {response.status_code}")
+            
+            # Check if response has content
+            if not response.content:
+                logger.warning("Empty response from properties endpoint")
+                return 0
+            
+            # Check content type
+            content_type = response.headers.get("content-type", "")
+            if "text/html" in content_type:
+                logger.warning("Received HTML response (likely login page) for properties")
+                raise Exception("Authentication failed - received HTML instead of JSON")
+            
+            # Try to parse JSON with detailed error handling
+            try:
+                properties_data = response.json()
+                logger.info(f"Successfully parsed properties JSON. Keys: {list(properties_data.keys()) if isinstance(properties_data, dict) else 'not_dict'}")
+            except Exception as json_error:
+                logger.error(f"Failed to parse properties JSON: {json_error}")
+                logger.error(f"Response content preview: {response.text[:500]}")
+                raise Exception(f"Failed to parse properties JSON: {json_error}")
+            
+            properties = properties_data.get("data", [])
+            logger.info(f"Found {len(properties)} properties")
+            
+            if not properties:
+                logger.warning("No properties found in response")
+                return 0
+            
+            total_units = 0
+            
+            # Try different approaches to count units
+            
+            # Approach 1: Try to get units from each property's units endpoint
+            logger.info("Approach 1: Fetching units from property-specific endpoints")
+            units_from_endpoints = 0
+            successful_property_requests = 0
+            
+            for i, property_data in enumerate(properties):
+                property_id = property_data.get("id")
+                if not property_id:
+                    logger.warning(f"Property {i} has no ID, skipping")
+                    continue
+                
+                logger.info(f"Fetching units for property {property_id} ({i+1}/{len(properties)})")
+                
+                try:
+                    units_response = await client.get(
+                        f"{DOORLOOP_BASE_URL}/properties/{property_id}/units",
+                        headers=headers,
+                        params={"limit": 1000}
+                    )
+                    
+                    logger.info(f"Units response for property {property_id}: Status {units_response.status_code}")
+                    
+                    if units_response.status_code == 200 and units_response.content:
+                        content_type = units_response.headers.get("content-type", "")
+                        if "text/html" not in content_type:
+                            try:
+                                units_data = units_response.json()
+                                units = units_data.get("data", [])
+                                units_from_endpoints += len(units)
+                                successful_property_requests += 1
+                                logger.info(f"Property {property_id} has {len(units)} units")
+                            except Exception as units_json_error:
+                                logger.error(f"Failed to parse units JSON for property {property_id}: {units_json_error}")
+                                continue
+                        else:
+                            logger.warning(f"Got HTML response for units of property {property_id}")
+                    else:
+                        logger.warning(f"Failed to fetch units for property {property_id}: Status {units_response.status_code}")
+                        
+                except Exception as units_error:
+                    logger.error(f"Error fetching units for property {property_id}: {units_error}")
+                    continue
+            
+            logger.info(f"Approach 1 result: {units_from_endpoints} units from {successful_property_requests}/{len(properties)} properties")
+            
+            # Approach 2: Try to get units from a general units endpoint
+            logger.info("Approach 2: Trying general units endpoint")
+            units_from_general_endpoint = 0
+            
+            try:
+                general_units_response = await client.get(
+                    f"{DOORLOOP_BASE_URL}/units",
+                    headers=headers,
+                    params={"limit": 1000}
+                )
+                
+                logger.info(f"General units endpoint status: {general_units_response.status_code}")
+                
+                if general_units_response.status_code == 200 and general_units_response.content:
+                    content_type = general_units_response.headers.get("content-type", "")
+                    if "text/html" not in content_type:
+                        try:
+                            general_units_data = general_units_response.json()
+                            general_units = general_units_data.get("data", [])
+                            units_from_general_endpoint = len(general_units)
+                            logger.info(f"General units endpoint returned {units_from_general_endpoint} units")
+                        except Exception as general_json_error:
+                            logger.error(f"Failed to parse general units JSON: {general_json_error}")
+                    else:
+                        logger.warning("General units endpoint returned HTML")
+                else:
+                    logger.info(f"General units endpoint not available (status: {general_units_response.status_code})")
+                    
+            except Exception as general_error:
+                logger.info(f"General units endpoint not accessible: {general_error}")
+            
+            # Approach 3: Check if properties have unit count fields
+            logger.info("Approach 3: Checking for unit count fields in property data")
+            units_from_property_fields = 0
+            
+            for i, property_data in enumerate(properties):
+                # Look for common field names that might indicate unit count
+                unit_count_fields = ["unitCount", "unit_count", "numberOfUnits", "unitsCount", "totalUnits"]
+                
+                for field in unit_count_fields:
+                    if field in property_data and isinstance(property_data[field], (int, float)):
+                        units_from_property_fields += int(property_data[field])
+                        logger.info(f"Property {i+1} has {property_data[field]} units (from {field} field)")
+                        break
+                else:
+                    # If no unit count field found, check if there are unit-related fields
+                    logger.debug(f"Property {i+1} fields: {list(property_data.keys())}")
+            
+            logger.info(f"Approach 3 result: {units_from_property_fields} units from property fields")
+            
+            # Choose the best result
+            if units_from_endpoints > 0:
+                total_units = units_from_endpoints
+                logger.info(f"Using Approach 1 result: {total_units} units from property endpoints")
+            elif units_from_general_endpoint > 0:
+                total_units = units_from_general_endpoint
+                logger.info(f"Using Approach 2 result: {total_units} units from general endpoint")
+            elif units_from_property_fields > 0:
+                total_units = units_from_property_fields
+                logger.info(f"Using Approach 3 result: {total_units} units from property fields")
+            else:
+                logger.warning("No units found with any approach")
+                total_units = 0
+            
+            logger.info(f"Final total units calculated: {total_units}")
+            return total_units
+            
+        except Exception as e:
+            logger.error(f"Error in get_total_units: {str(e)}")
+            raise
+
+async def get_occupied_units(headers, date_from, date_to):
+    """Get number of occupied units based on active leases"""
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            # Get all active leases within the date range
+            logger.info(f"Fetching leases from {DOORLOOP_BASE_URL}/leases")
+            logger.info(f"Date range: {date_from} to {date_to}")
+            
+            # Try with different parameter combinations since we're not sure of the exact API format
+            params_to_try = [
+                {
+                    "limit": 1000,
+                    "status": "active",
+                    "start_date_from": date_from,
+                    "start_date_to": date_to
+                },
+                {
+                    "limit": 1000,
+                    "status": "active"
+                },
+                {
+                    "limit": 1000
+                }
+            ]
+            
+            leases_data = None
+            for i, params in enumerate(params_to_try):
+                logger.info(f"Trying leases request {i+1} with params: {params}")
+                
+                response = await client.get(
+                    f"{DOORLOOP_BASE_URL}/leases",
+                    headers=headers,
+                    params=params
+                )
+                
+                logger.info(f"Leases response status: {response.status_code}")
+                logger.info(f"Leases response content type: {response.headers.get('content-type', '')}")
+                logger.info(f"Leases response has content: {bool(response.content)}")
+                
+                if response.status_code == 200 and response.content:
+                    content_type = response.headers.get("content-type", "")
+                    if "text/html" not in content_type:
+                        try:
+                            leases_data = response.json()
+                            logger.info(f"Successfully parsed leases JSON with params {i+1}")
+                            break
+                        except Exception as json_error:
+                            logger.error(f"Failed to parse leases JSON with params {i+1}: {json_error}")
+                            continue
+                else:
+                    logger.warning(f"Request {i+1} failed with status {response.status_code}")
+            
+            if not leases_data:
+                logger.error("All lease request attempts failed")
+                raise Exception("Failed to fetch leases with any parameter combination")
+            
+            logger.info(f"Successfully parsed leases JSON. Keys: {list(leases_data.keys()) if isinstance(leases_data, dict) else 'not_dict'}")
+            
+            leases = leases_data.get("data", [])
+            logger.info(f"Found {len(leases)} leases")
+            
+            if not leases:
+                logger.warning("No leases found")
+                return 0
+            
+            # Count unique units that have active leases
+            occupied_unit_ids = set()
+            
+            for i, lease in enumerate(leases):
+                logger.debug(f"Processing lease {i+1}/{len(leases)}")
+                
+                # Try different ways to extract unit IDs based on the actual data structure
+                unit_ids = []
+                
+                # Method 1: Check if 'units' field contains an array of unit IDs
+                if "units" in lease and isinstance(lease["units"], list):
+                    unit_ids.extend(lease["units"])
+                    logger.debug(f"Lease {i+1}: Found units array with {len(lease['units'])} units")
+                
+                # Method 2: Check for single unit ID fields
+                for field_name in ["unit_id", "unitId", "propertyUnitId", "unit"]:
+                    if field_name in lease and lease[field_name]:
+                        if isinstance(lease[field_name], list):
+                            unit_ids.extend(lease[field_name])
+                        else:
+                            unit_ids.append(lease[field_name])
+                        logger.debug(f"Lease {i+1}: Found {field_name} = {lease[field_name]}")
+                
+                # Add all found unit IDs to the set
+                for unit_id in unit_ids:
+                    if unit_id:  # Make sure it's not None or empty
+                        occupied_unit_ids.add(str(unit_id))  # Convert to string for consistency
+                
+                if not unit_ids:
+                    logger.debug(f"Lease {i+1}: No unit_id found. Available keys: {list(lease.keys())}")
+                    # Log a sample of the lease data to understand structure
+                    if i < 3:  # Only log first few for debugging
+                        logger.debug(f"Lease {i+1} sample data: {str(lease)[:200]}...")
+            
+            occupied_count = len(occupied_unit_ids)
+            logger.info(f"Total unique occupied units: {occupied_count}")
+            logger.info(f"Sample occupied unit IDs: {list(occupied_unit_ids)[:5]}")  # Show first 5
+            return occupied_count
+            
+        except Exception as e:
+            logger.error(f"Error in get_occupied_units: {str(e)}")
+            raise
+
+@router.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "service": "DoorLoop Occupancy Rate API"}
+
+@router.get("/debug-occupancy")
+async def debug_occupancy_rate():
+    """Debug endpoint to test occupancy rate calculation step by step"""
+    
+    if not DOORLOOP_API_KEY:
+        return {"error": "DoorLoop API token not configured"}
+    
+    headers = get_doorloop_headers()
+    debug_info = {}
+    
+    async with httpx.AsyncClient() as client:
+        # Test 1: Check properties endpoint
+        try:
+            logger.info("DEBUG: Testing properties endpoint")
+            response = await client.get(
+                f"{DOORLOOP_BASE_URL}/properties",
+                headers=headers,
+                params={"limit": 5}  # Small limit for testing
+            )
+            
+            debug_info["properties_test"] = {
+                "status_code": response.status_code,
+                "content_type": response.headers.get("content-type", ""),
+                "has_content": bool(response.content),
+                "content_length": len(response.content) if response.content else 0,
+                "response_preview": response.text[:200] if response.content else "No content"
+            }
+            
+            if response.status_code == 200 and response.content:
+                try:
+                    data = response.json()
+                    debug_info["properties_test"]["json_parse"] = "success"
+                    debug_info["properties_test"]["data_keys"] = list(data.keys()) if isinstance(data, dict) else "not_dict"
+                    debug_info["properties_test"]["data_count"] = len(data.get("data", [])) if isinstance(data, dict) else 0
+                except Exception as json_error:
+                    debug_info["properties_test"]["json_parse"] = f"failed: {str(json_error)}"
+            
+        except Exception as e:
+            debug_info["properties_test"] = {"error": str(e)}
+        
+        # Test 2: Check leases endpoint
+        try:
+            logger.info("DEBUG: Testing leases endpoint")
+            response = await client.get(
+                f"{DOORLOOP_BASE_URL}/leases",
+                headers=headers,
+                params={"limit": 5}  # Small limit for testing
+            )
+            
+            debug_info["leases_test"] = {
+                "status_code": response.status_code,
+                "content_type": response.headers.get("content-type", ""),
+                "has_content": bool(response.content),
+                "content_length": len(response.content) if response.content else 0,
+                "response_preview": response.text[:200] if response.content else "No content"
+            }
+            
+            if response.status_code == 200 and response.content:
+                try:
+                    data = response.json()
+                    debug_info["leases_test"]["json_parse"] = "success"
+                    debug_info["leases_test"]["data_keys"] = list(data.keys()) if isinstance(data, dict) else "not_dict"
+                    debug_info["leases_test"]["data_count"] = len(data.get("data", [])) if isinstance(data, dict) else 0
+                except Exception as json_error:
+                    debug_info["leases_test"]["json_parse"] = f"failed: {str(json_error)}"
+            
+        except Exception as e:
+            debug_info["leases_test"] = {"error": str(e)}
+        
+        # Test 3: Try alternative API base URLs
+        alternative_bases = [
+            "https://api.doorloop.com/v1",
+            "https://api.doorloop.com",
+            "https://app.doorloop.com/api/v1"
+        ]
+        
+        debug_info["alternative_bases"] = {}
+        
+        for base_url in alternative_bases:
+            try:
+                test_response = await client.get(
+                    f"{base_url}/properties",
+                    headers=headers,
+                    params={"limit": 1}
+                )
+                
+                debug_info["alternative_bases"][base_url] = {
+                    "status_code": test_response.status_code,
+                    "content_type": test_response.headers.get("content-type", ""),
+                    "has_content": bool(test_response.content),
+                    "is_html": "text/html" in test_response.headers.get("content-type", "")
+                }
+                
+            except Exception as e:
+                debug_info["alternative_bases"][base_url] = {"error": str(e)}
+    
     return {
-        "error": "All parameter variations failed",
-        "tried_variations": params_variations,
-        "suggestion": "The API might require additional parameters or different authentication",
-        "next_steps": [
-            "Check Doorloop API documentation for exact parameter names",
-            "Try using browser dev tools to see the exact request format",
-            "Contact Doorloop support for API parameter specifications"
+        "message": "Occupancy rate debug information",
+        "current_base_url": DOORLOOP_BASE_URL,
+        "headers_used": headers,
+        "debug_results": debug_info,
+        "recommendations": [
+            "Check if properties_test shows successful JSON parsing",
+            "Check if leases_test shows successful JSON parsing", 
+            "If both fail, the API token might be invalid or the base URL is wrong",
+            "Try alternative base URLs if current one fails"
         ]
     }
+
