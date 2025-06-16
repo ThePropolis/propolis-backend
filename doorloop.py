@@ -984,3 +984,56 @@ async def debug_occupancy_rate():
         ]
     }
 
+@router.get("/units")
+async def get_units():
+    """Get all units from Doorloop API."""
+    units_url = f"{DOORLOOP_BASE_URL}/units"
+    headers = get_doorloop_headers()
+    
+    logger.info(f"Making request to: {units_url}")
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(units_url, headers=headers)
+            resp.raise_for_status()
+            
+            # Check if response has content
+            if not resp.content:
+                logger.warning("Empty response from Doorloop units API")
+                return {"message": "No units data available", "data": []}
+            
+            # Check content type
+            content_type = resp.headers.get("content-type", "")
+            logger.info(f"Response content type: {content_type}")
+            
+            # Check if we got HTML (login page) instead of JSON
+            if "text/html" in content_type:
+                logger.warning("Received HTML response (likely login page)")
+                return {
+                    "message": "Received HTML response (likely login page)",
+                    "content_type": content_type,
+                    "suggestion": "This endpoint may not exist or requires different authentication"
+                }
+            
+            # Try to parse JSON
+            try:
+                data = resp.json()
+                logger.info(f"Successfully fetched {len(data.get('data', []))} units from Doorloop")
+                return data
+            except ValueError as json_error:
+                logger.error(f"Failed to parse JSON response: {json_error}")
+                return {
+                    "message": "Units data received but not in JSON format",
+                    "content_type": content_type,
+                    "raw_response": resp.text
+                }
+                
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP Error {e.response.status_code} for units: {e.response.text}")
+            if e.response.status_code == 404:
+                raise HTTPException(status_code=404, detail="Units endpoint not found")
+            raise HTTPException(status_code=502, detail=f"Failed to fetch units from Doorloop: {e.response.status_code}") from e
+        except Exception as e:
+            logger.error(f"Unexpected error fetching units: {e}")
+            raise HTTPException(status_code=500, detail="Internal server error") from e
+
