@@ -446,30 +446,43 @@ async def explore_doorloop_financial_data():
 
 @router.get("/profit-and-loss")
 async def get_doorloop_profit_and_loss(
-    accounting_method: str = "cash",
     start_date: str = None,
-    end_date: str = None
+    end_date: str = None,
+    property_id: str = None,
+    unit_id: str = None,
+    accounting_method: str = "CASH"
 ):
     """Get profit and loss summary from Doorloop API.
     
     Args:
-        accounting_method: Accounting method - typically 'cash' or 'accrual'
-        start_date: Start date for the report (YYYY-MM-DD format)
-        end_date: End date for the report (YYYY-MM-DD format)
+        start_date: Start date for the report (YYYY-MM-DD format) - defaults to today
+        end_date: End date for the report (YYYY-MM-DD format) - defaults to today
+        property_id: Optional property ID to filter by
+        unit_id: Optional unit ID to filter by
+        accounting_method: Accounting method - defaults to 'CASH'
     """
+    # Set default dates to today if not provided (matching PHP implementation)
+    if not start_date:
+        start_date = datetime.now().strftime('%Y-%m-%d')
+    if not end_date:
+        end_date = datetime.now().strftime('%Y-%m-%d')
+    
     pl_url = f"{DOORLOOP_BASE_URL}/reports/profit-and-loss-summary"
     headers = get_doorloop_headers()
     
-    # Build query parameters
+    # Build query parameters matching the PHP implementation
     params = {
-        "filter_accountingMethod": accounting_method.upper()
+        "filter_accountingMethod": accounting_method.upper(),
+        "filter_date_from": start_date,
+        "filter_date_to": end_date,
+        "page_size": 500
     }
     
-    # Add date filters if provided
-    if start_date:
-        params["filter_startDate"] = start_date
-    if end_date:
-        params["filter_endDate"] = end_date
+    # Add optional filters
+    if property_id:
+        params["filter_property"] = property_id
+    if unit_id:
+        params["filter_unit"] = unit_id
     
     logger.info(f"Making request to: {pl_url} with params: {params}")
     
@@ -481,7 +494,7 @@ async def get_doorloop_profit_and_loss(
             # Check if response has content
             if not resp.content:
                 logger.warning("Empty response from Doorloop P&L API")
-                return {"message": "No profit and loss data available", "data": []}
+                return {"success": False, "message": "No profit and loss data available", "data": []}
             
             # Check content type
             content_type = resp.headers.get("content-type", "")
@@ -491,6 +504,7 @@ async def get_doorloop_profit_and_loss(
             if "text/html" in content_type:
                 logger.warning("Received HTML response (likely login page)")
                 return {
+                    "success": False,
                     "message": "Received HTML response (likely login page)",
                     "content_type": content_type,
                     "suggestion": "This endpoint may not exist or requires different authentication"
@@ -502,41 +516,31 @@ async def get_doorloop_profit_and_loss(
                 logger.info("Successfully fetched profit and loss data from Doorloop")
                 return {
                     "success": True,
-                    "parameters_used": params,
                     "data": data
                 }
             except ValueError as json_error:
                 logger.error(f"Failed to parse JSON response: {json_error}")
                 logger.info(f"Response content: {resp.text[:500]}...")
                 return {
+                    "success": False,
                     "message": "P&L data received but not in JSON format",
                     "content_type": content_type,
-                    "raw_response": resp.text[:1000]
+                    "raw_response": resp.text
                 }
                 
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP Error {e.response.status_code} for P&L: {e.response.text}")
-            if e.response.status_code == 400:
-                # Parse the error message to provide helpful feedback
-                try:
-                    error_data = e.response.json()
-                    return {
-                        "error": "Bad Request - Missing or invalid parameters",
-                        "details": error_data,
-                        "parameters_sent": params,
-                        "suggestion": "Check the error details above for specific parameter issues"
-                    }
-                except:
-                    return {
-                        "error": "Bad Request",
-                        "parameters_sent": params,
-                        "response_text": e.response.text
-                    }
-            raise HTTPException(status_code=502, detail=f"Failed to fetch P&L from Doorloop: {e.response.status_code}") from e
+            return {
+                "success": False,
+                "status": e.response.status_code,
+                "message": "Something went wrong"
+            }
         except Exception as e:
             logger.error(f"Unexpected error fetching P&L: {e}")
-            raise HTTPException(status_code=500, detail="Internal server error") from e
-        
+            return {
+                "success": False,
+                "message": str(e)
+            }
 
 @router.get("/occupancy-rate-doorloop")
 async def get_occupancy_rate(
@@ -983,4 +987,57 @@ async def debug_occupancy_rate():
             "Try alternative base URLs if current one fails"
         ]
     }
+
+@router.get("/units")
+async def get_units():
+    """Get all units from Doorloop API."""
+    units_url = f"{DOORLOOP_BASE_URL}/units"
+    headers = get_doorloop_headers()
+    
+    logger.info(f"Making request to: {units_url}")
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(units_url, headers=headers)
+            resp.raise_for_status()
+            
+            # Check if response has content
+            if not resp.content:
+                logger.warning("Empty response from Doorloop units API")
+                return {"message": "No units data available", "data": []}
+            
+            # Check content type
+            content_type = resp.headers.get("content-type", "")
+            logger.info(f"Response content type: {content_type}")
+            
+            # Check if we got HTML (login page) instead of JSON
+            if "text/html" in content_type:
+                logger.warning("Received HTML response (likely login page)")
+                return {
+                    "message": "Received HTML response (likely login page)",
+                    "content_type": content_type,
+                    "suggestion": "This endpoint may not exist or requires different authentication"
+                }
+            
+            # Try to parse JSON
+            try:
+                data = resp.json()
+                logger.info(f"Successfully fetched {len(data.get('data', []))} units from Doorloop")
+                return data
+            except ValueError as json_error:
+                logger.error(f"Failed to parse JSON response: {json_error}")
+                return {
+                    "message": "Units data received but not in JSON format",
+                    "content_type": content_type,
+                    "raw_response": resp.text
+                }
+                
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP Error {e.response.status_code} for units: {e.response.text}")
+            if e.response.status_code == 404:
+                raise HTTPException(status_code=404, detail="Units endpoint not found")
+            raise HTTPException(status_code=502, detail=f"Failed to fetch units from Doorloop: {e.response.status_code}") from e
+        except Exception as e:
+            logger.error(f"Unexpected error fetching units: {e}")
+            raise HTTPException(status_code=500, detail="Internal server error") from e
 
