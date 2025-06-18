@@ -122,7 +122,7 @@ async def get_guesty_revenue(
     """Get revenue data from Guesty reservations with financial details."""
     revenue_url = "https://open-api.guesty.com/v1/reservations"
     
-    # Financial fields to include in the response
+    # Financial fields to include in the response (matching PHP implementation)
     financial_fields = [
         "money.hostPayout",
         "money.hostPayoutUsd", 
@@ -138,8 +138,8 @@ async def get_guesty_revenue(
         "money.payments.currency",
         "money.payments.paidAt",
         "confirmationCode",
-        "checkInDateLocalized",
-        "checkOutDateLocalized",
+        "checkIn",
+        "checkOut",
         "nightsCount",
         "guestsCount",
         "listing._id",
@@ -162,29 +162,117 @@ async def get_guesty_revenue(
         "sort": "-createdAt"
     }
     
-    # Add date filters if provided
+    # Try different filtering strategies (matching PHP format)
+    filtering_strategies = []
+    
     if start_date and end_date:
-        date_filter = [
+        # Strategy 1: Filter by check-in date (matching PHP checkIn field)
+        strategy1 = [
             {
-                "operator": "$between",
-                "field": "checkOutDateLocalized", 
-                "from": start_date,
-                "to": end_date
+                "field": "checkIn",
+                "operator": "$gte", 
+                "value": start_date
             },
             {
-                "operator": "$eq",
+                "field": "checkIn",
+                "operator": "$lte", 
+                "value": end_date
+            }
+        ]
+        filtering_strategies.append(("checkIn_range", strategy1))
+        
+        # Strategy 2: Filter by check-out date (matching PHP checkOut field)  
+        strategy2 = [
+            {
+                "field": "checkOut",
+                "operator": "$gte", 
+                "value": start_date
+            },
+            {
+                "field": "checkOut",
+                "operator": "$lte", 
+                "value": end_date
+            }
+        ]
+        filtering_strategies.append(("checkOut_range", strategy2))
+        
+        # Strategy 3: Filter reservations that overlap with the date range
+        strategy3 = [
+            {
+                "field": "checkIn",
+                "operator": "$lte", 
+                "value": end_date
+            },
+            {
+                "field": "checkOut",
+                "operator": "$gte", 
+                "value": start_date
+            }
+        ]
+        filtering_strategies.append(("overlap_range", strategy3))
+        
+        # Strategy 4: Add status filter (matching PHP approach)
+        strategy4 = [
+            {
+                "field": "checkIn",
+                "operator": "$gte", 
+                "value": start_date
+            },
+            {
+                "field": "checkIn",
+                "operator": "$lte", 
+                "value": end_date
+            },
+            {
                 "field": "status",
+                "operator": "$eq", 
                 "value": "confirmed"
             }
         ]
-        params["filters"] = str(date_filter).replace("'", '"')
+        filtering_strategies.append(("checkIn_with_status", strategy4))
     
     async with httpx.AsyncClient() as client:
-        resp = await client.get(revenue_url, headers=headers, params=params)
+        # Try each filtering strategy
+        for strategy_name, date_filter in filtering_strategies:
+            try:
+                # Convert to proper JSON string (matching PHP format)
+                import json
+                params["filters"] = json.dumps(date_filter)
+                
+                print(f"DEBUG: Trying strategy: {strategy_name}")
+                print(f"DEBUG: Using date filter: {params['filters']}")
+                print(f"DEBUG: Start date: {start_date}, End date: {end_date}")
+                
+                resp = await client.get(revenue_url, headers=headers, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+                
+                print(f"DEBUG: Response status: {resp.status_code}")
+                print(f"DEBUG: Results count: {len(data.get('results', []))}")
+                
+                # If we got results, use this strategy
+                if data.get("results") and len(data["results"]) > 0:
+                    print(f"DEBUG: Strategy {strategy_name} returned {len(data['results'])} results")
+                    break
+                else:
+                    print(f"DEBUG: Strategy {strategy_name} returned no results, trying next...")
+                    
+            except Exception as e:
+                print(f"DEBUG: Strategy {strategy_name} failed: {str(e)}")
+                continue
+        else:
+            # If no strategies worked, try without date filter
+            print("DEBUG: All date filtering strategies failed, trying without date filter...")
+            if "filters" in params:
+                del params["filters"]
+            resp = await client.get(revenue_url, headers=headers, params=params)
+            resp.raise_for_status()
+            data = resp.json()
     
     try:
-        resp.raise_for_status()
-        data = resp.json()
+        print(f"DEBUG: Final response status: {resp.status_code}")
+        print(f"DEBUG: Final response data keys: {list(data.keys()) if isinstance(data, dict) else 'not_dict'}")
+        print(f"DEBUG: Final results count: {len(data.get('results', []))}")
         
         # Calculate summary statistics
         total_revenue = 0
@@ -194,11 +282,22 @@ async def get_guesty_revenue(
         
         if "results" in data:
             for reservation in data["results"]:
+                print(f"DEBUG: Processing reservation: {reservation.get('confirmationCode', 'no_code')}")
+                print(f"DEBUG: Reservation status: {reservation.get('status', 'no_status')}")
+                print(f"DEBUG: Check-in date: {reservation.get('checkIn', 'no_date')}")
+                print(f"DEBUG: Check-out date: {reservation.get('checkOut', 'no_date')}")
+                
                 if "money" in reservation:
                     money = reservation["money"]
-                    total_revenue += money.get("hostPayoutUsd", 0)
-                    total_paid += money.get("totalPaid", 0) 
-                    total_due += money.get("balanceDue", 0)
+                    host_payout = money.get("hostPayoutUsd", 0)
+                    total_paid_amount = money.get("totalPaid", 0)
+                    balance_due = money.get("balanceDue", 0)
+                    
+                    print(f"DEBUG: Host payout: {host_payout}, Total paid: {total_paid_amount}, Balance due: {balance_due}")
+                    
+                    total_revenue += host_payout
+                    total_paid += total_paid_amount
+                    total_due += balance_due
                     reservation_count += 1
         
         # Add summary to response
@@ -211,12 +310,18 @@ async def get_guesty_revenue(
             "date_range": {
                 "start_date": start_date,
                 "end_date": end_date
-            } if start_date and end_date else None
+            } if start_date and end_date else None,
+            "debug_info": {
+                "filters_applied": bool(start_date and end_date),
+                "filter_string": params.get("filters", "none"),
+                "strategies_tried": [name for name, _ in filtering_strategies] if start_date and end_date else []
+            }
         }
         
         return response_data
         
     except httpx.HTTPStatusError as e:
+        print(f"DEBUG: HTTP Error {e.response.status_code}: {e.response.text}")
         raise HTTPException(status_code=502, detail="Failed to fetch revenue data") from e
     
 
@@ -287,13 +392,15 @@ async def get_occupied_units(
         "sort": "_id"
     }
     
-    # Filter for confirmed reservations in date range
+    # Filter for confirmed reservations in date range (matching PHP format)
     filters = [
-        {"operator": "$eq", "field": "status", "value": "confirmed"},
-        {"operator": "$between", "field": "checkInDateLocalized", "from": date_from, "to": date_to}
+        {"field": "status", "operator": "$eq", "value": "confirmed"},
+        {"field": "checkIn", "operator": "$gte", "value": date_from},
+        {"field": "checkIn", "operator": "$lte", "value": date_to}
     ]
     
-    params["filters"] = str(filters).replace("'", '"')
+    import json
+    params["filters"] = json.dumps(filters)
     
     occupied_property_ids = set()
     skip = 0
