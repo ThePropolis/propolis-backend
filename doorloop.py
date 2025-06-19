@@ -774,26 +774,45 @@ async def get_occupied_units(headers, date_from, date_to):
             logger.info(f"Fetching leases from {DOORLOOP_BASE_URL}/leases")
             logger.info(f"Date range: {date_from} to {date_to}")
             
-            # Try with different parameter combinations since we're not sure of the exact API format
+            # Use the correct Doorloop API parameter format (matching profit-and-loss implementation)
             params_to_try = [
+                # Strategy 1: Filter by lease start date (most likely for occupancy)
                 {
                     "limit": 1000,
-                    "status": "active",
-                    "start_date_from": date_from,
-                    "start_date_to": date_to
+                    "filter_date_from": date_from,
+                    "filter_date_to": date_to,
+                    "filter_status": "active"
                 },
+                # Strategy 2: Filter by lease end date 
                 {
                     "limit": 1000,
-                    "status": "active"
+                    "filter_end_date_from": date_from,
+                    "filter_end_date_to": date_to,
+                    "filter_status": "active"
                 },
+                # Strategy 3: Just active leases without date filter (fallback)
+                {
+                    "limit": 1000,
+                    "filter_status": "active"
+                },
+                # Strategy 4: All leases without any filters (last resort)
                 {
                     "limit": 1000
                 }
             ]
             
             leases_data = None
+            successful_strategy = None
+            
             for i, params in enumerate(params_to_try):
-                logger.info(f"Trying leases request {i+1} with params: {params}")
+                strategy_name = [
+                    "lease_start_date_filter",
+                    "lease_end_date_filter", 
+                    "active_status_only",
+                    "no_filters"
+                ][i]
+                
+                logger.info(f"Trying strategy {i+1} ({strategy_name}) with params: {params}")
                 
                 response = await client.get(
                     f"{DOORLOOP_BASE_URL}/leases",
@@ -801,41 +820,78 @@ async def get_occupied_units(headers, date_from, date_to):
                     params=params
                 )
                 
-                logger.info(f"Leases response status: {response.status_code}")
-                logger.info(f"Leases response content type: {response.headers.get('content-type', '')}")
-                logger.info(f"Leases response has content: {bool(response.content)}")
+                logger.info(f"Strategy {strategy_name} - Response status: {response.status_code}")
+                logger.info(f"Strategy {strategy_name} - Content type: {response.headers.get('content-type', '')}")
+                logger.info(f"Strategy {strategy_name} - Has content: {bool(response.content)}")
                 
                 if response.status_code == 200 and response.content:
                     content_type = response.headers.get("content-type", "")
                     if "text/html" not in content_type:
                         try:
                             leases_data = response.json()
-                            logger.info(f"Successfully parsed leases JSON with params {i+1}")
-                            break
+                            successful_strategy = strategy_name
+                            logger.info(f"Successfully parsed leases JSON with strategy: {strategy_name}")
+                            
+                            # Check if we got meaningful results
+                            leases_count = len(leases_data.get("data", []))
+                            logger.info(f"Strategy {strategy_name} returned {leases_count} leases")
+                            
+                            # If this is a date-filtered strategy and we got results, use it
+                            if i <= 1 and leases_count > 0:
+                                break
+                            # If this is a fallback strategy, use it only if no better option
+                            elif i > 1:
+                                break
+                                
                         except Exception as json_error:
-                            logger.error(f"Failed to parse leases JSON with params {i+1}: {json_error}")
+                            logger.error(f"Failed to parse leases JSON with strategy {strategy_name}: {json_error}")
                             continue
                 else:
-                    logger.warning(f"Request {i+1} failed with status {response.status_code}")
+                    logger.warning(f"Strategy {strategy_name} failed with status {response.status_code}")
             
             if not leases_data:
-                logger.error("All lease request attempts failed")
+                logger.error("All lease request strategies failed")
                 raise Exception("Failed to fetch leases with any parameter combination")
             
-            logger.info(f"Successfully parsed leases JSON. Keys: {list(leases_data.keys()) if isinstance(leases_data, dict) else 'not_dict'}")
+            logger.info(f"Using strategy: {successful_strategy}")
+            logger.info(f"Leases response keys: {list(leases_data.keys()) if isinstance(leases_data, dict) else 'not_dict'}")
             
             leases = leases_data.get("data", [])
-            logger.info(f"Found {len(leases)} leases")
+            logger.info(f"Found {len(leases)} total leases")
             
             if not leases:
                 logger.warning("No leases found")
                 return 0
             
-            # Count unique units that have active leases
+            # Count unique units that have active leases within the date range
             occupied_unit_ids = set()
             
             for i, lease in enumerate(leases):
                 logger.debug(f"Processing lease {i+1}/{len(leases)}")
+                
+                # Check if lease is within the date range (if we're using a fallback strategy)
+                if successful_strategy in ["active_status_only", "no_filters"]:
+                    # Manual date filtering for fallback strategies
+                    lease_start = lease.get("startDate") or lease.get("start_date") or lease.get("createdAt")
+                    lease_end = lease.get("endDate") or lease.get("end_date") or lease.get("expiresAt")
+                    
+                    if lease_start:
+                        try:
+                            from datetime import datetime
+                            lease_start_dt = datetime.fromisoformat(lease_start.replace('Z', '+00:00'))
+                            date_from_dt = datetime.fromisoformat(f"{date_from}T00:00:00+00:00")
+                            date_to_dt = datetime.fromisoformat(f"{date_to}T23:59:59+00:00")
+                            
+                            # Skip leases that don't overlap with our date range
+                            if lease_start_dt > date_to_dt:
+                                continue
+                            if lease_end:
+                                lease_end_dt = datetime.fromisoformat(lease_end.replace('Z', '+00:00'))
+                                if lease_end_dt < date_from_dt:
+                                    continue
+                        except Exception as date_error:
+                            logger.debug(f"Could not parse dates for lease {i+1}: {date_error}")
+                            # Include the lease if we can't parse dates
                 
                 # Try different ways to extract unit IDs based on the actual data structure
                 unit_ids = []
@@ -846,7 +902,7 @@ async def get_occupied_units(headers, date_from, date_to):
                     logger.debug(f"Lease {i+1}: Found units array with {len(lease['units'])} units")
                 
                 # Method 2: Check for single unit ID fields
-                for field_name in ["unit_id", "unitId", "propertyUnitId", "unit"]:
+                for field_name in ["unit_id", "unitId", "propertyUnitId", "unit", "unitIds"]:
                     if field_name in lease and lease[field_name]:
                         if isinstance(lease[field_name], list):
                             unit_ids.extend(lease[field_name])
@@ -868,6 +924,7 @@ async def get_occupied_units(headers, date_from, date_to):
             occupied_count = len(occupied_unit_ids)
             logger.info(f"Total unique occupied units: {occupied_count}")
             logger.info(f"Sample occupied unit IDs: {list(occupied_unit_ids)[:5]}")  # Show first 5
+            logger.info(f"Strategy used: {successful_strategy}")
             return occupied_count
             
         except Exception as e:
@@ -989,22 +1046,69 @@ async def debug_occupancy_rate():
     }
 
 @router.get("/units")
-async def get_units():
-    """Get all units from Doorloop API."""
+async def get_units(
+    property_id: str = None,
+    status: str = None,
+    unit_type: str = None,
+    limit: int = 100,
+    page: int = 1
+):
+    """Get units from Doorloop API with optional filtering.
+    
+    Args:
+        property_id: Filter by specific property ID
+        status: Filter by unit status (e.g., 'available', 'occupied', 'maintenance')
+        unit_type: Filter by unit type
+        limit: Number of units per page (default: 100, max: 500)
+        page: Page number (default: 1)
+    """
     units_url = f"{DOORLOOP_BASE_URL}/units"
     headers = get_doorloop_headers()
     
-    logger.info(f"Making request to: {units_url}")
+    # Build query parameters
+    params = {
+        "limit": min(limit, 500),  # Cap at 500 to prevent overload
+        "page": page
+    }
+    
+    # Add optional filters
+    if property_id:
+        params["property_id"] = property_id
+    if status:
+        params["status"] = status
+    if unit_type:
+        params["unit_type"] = unit_type
+    
+    logger.info(f"Making request to: {units_url} with params: {params}")
     
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(units_url, headers=headers)
+            resp = await client.get(units_url, headers=headers, params=params)
+            
+            # Log response details for debugging
+            logger.info(f"Units API response status: {resp.status_code}")
+            logger.info(f"Units API response headers: {dict(resp.headers)}")
+            
             resp.raise_for_status()
             
             # Check if response has content
             if not resp.content:
                 logger.warning("Empty response from Doorloop units API")
-                return {"message": "No units data available", "data": []}
+                return {
+                    "success": True,
+                    "message": "No units data available", 
+                    "data": [],
+                    "pagination": {
+                        "page": page,
+                        "limit": limit,
+                        "total": 0
+                    },
+                    "filters_applied": {
+                        "property_id": property_id,
+                        "status": status,
+                        "unit_type": unit_type
+                    }
+                }
             
             # Check content type
             content_type = resp.headers.get("content-type", "")
@@ -1014,6 +1118,7 @@ async def get_units():
             if "text/html" in content_type:
                 logger.warning("Received HTML response (likely login page)")
                 return {
+                    "success": False,
                     "message": "Received HTML response (likely login page)",
                     "content_type": content_type,
                     "suggestion": "This endpoint may not exist or requires different authentication"
@@ -1022,22 +1127,175 @@ async def get_units():
             # Try to parse JSON
             try:
                 data = resp.json()
-                logger.info(f"Successfully fetched {len(data.get('data', []))} units from Doorloop")
-                return data
+                units = data.get('data', [])
+                total_count = data.get('total', len(units))
+                
+                logger.info(f"Successfully fetched {len(units)} units from Doorloop (page {page})")
+                
+                # Calculate pagination info
+                total_pages = (total_count + limit - 1) // limit  # Ceiling division
+                has_next = page < total_pages
+                has_prev = page > 1
+                
+                return {
+                    "success": True,
+                    "data": units,
+                    "pagination": {
+                        "page": page,
+                        "limit": limit,
+                        "total": total_count,
+                        "total_pages": total_pages,
+                        "has_next": has_next,
+                        "has_prev": has_prev,
+                        "next_page": page + 1 if has_next else None,
+                        "prev_page": page - 1 if has_prev else None
+                    },
+                    "filters_applied": {
+                        "property_id": property_id,
+                        "status": status,
+                        "unit_type": unit_type
+                    },
+                    "summary": {
+                        "units_on_page": len(units),
+                        "total_units": total_count
+                    }
+                }
+                
             except ValueError as json_error:
                 logger.error(f"Failed to parse JSON response: {json_error}")
+                logger.error(f"Response content preview: {resp.text[:500]}")
                 return {
+                    "success": False,
                     "message": "Units data received but not in JSON format",
                     "content_type": content_type,
-                    "raw_response": resp.text
+                    "raw_response": resp.text[:1000]  # First 1000 chars for debugging
                 }
                 
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP Error {e.response.status_code} for units: {e.response.text}")
-            if e.response.status_code == 404:
-                raise HTTPException(status_code=404, detail="Units endpoint not found")
-            raise HTTPException(status_code=502, detail=f"Failed to fetch units from Doorloop: {e.response.status_code}") from e
+            
+            if e.response.status_code == 400:
+                try:
+                    error_data = e.response.json()
+                    return {
+                        "success": False,
+                        "status": 400,
+                        "message": "Bad Request - Invalid parameters",
+                        "error_details": error_data,
+                        "parameters_sent": params,
+                        "suggestion": "Check if the filter parameters are valid"
+                    }
+                except:
+                    return {
+                        "success": False,
+                        "status": 400,
+                        "message": "Bad Request",
+                        "error_text": e.response.text,
+                        "parameters_sent": params
+                    }
+            elif e.response.status_code == 404:
+                return {
+                    "success": False,
+                    "status": 404,
+                    "message": "Units endpoint not found",
+                    "suggestion": "The /units endpoint may not be available in your Doorloop plan"
+                }
+            else:
+                return {
+                    "success": False,
+                    "status": e.response.status_code,
+                    "message": f"HTTP Error {e.response.status_code}",
+                    "error_details": e.response.text
+                }
+                
         except Exception as e:
             logger.error(f"Unexpected error fetching units: {e}")
-            raise HTTPException(status_code=500, detail="Internal server error") from e
+            return {
+                "success": False,
+                "message": f"Unexpected error: {str(e)}",
+                "error_type": type(e).__name__
+            }
+
+@router.get("/units/{unit_id}")
+async def get_unit_by_id(unit_id: str):
+    """Get a specific unit by ID from Doorloop API."""
+    # Clean the unit ID - remove quotes if present
+    clean_unit_id = unit_id.strip('"\'')
+    
+    unit_url = f"{DOORLOOP_BASE_URL}/units/{clean_unit_id}"
+    headers = get_doorloop_headers()
+    
+    logger.info(f"Making request to: {unit_url}")
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(unit_url, headers=headers)
+            resp.raise_for_status()
+            
+            # Check if response has content
+            if not resp.content:
+                logger.warning(f"Empty response for unit {clean_unit_id}")
+                return {
+                    "success": False,
+                    "message": f"No data found for unit {clean_unit_id}",
+                    "unit_id": clean_unit_id
+                }
+            
+            # Check content type
+            content_type = resp.headers.get("content-type", "")
+            
+            # Check if we got HTML (login page) instead of JSON
+            if "text/html" in content_type:
+                logger.warning("Received HTML response (likely login page)")
+                return {
+                    "success": False,
+                    "message": "Received HTML response (likely login page)",
+                    "content_type": content_type,
+                    "suggestion": "This endpoint may not exist or requires different authentication"
+                }
+            
+            # Try to parse JSON
+            try:
+                data = resp.json()
+                logger.info(f"Successfully fetched unit {clean_unit_id} from Doorloop")
+                return {
+                    "success": True,
+                    "data": data,
+                    "unit_id": clean_unit_id
+                }
+            except ValueError as json_error:
+                logger.error(f"Failed to parse JSON response for unit {clean_unit_id}: {json_error}")
+                return {
+                    "success": False,
+                    "message": "Unit data received but not in JSON format",
+                    "content_type": content_type,
+                    "raw_response": resp.text[:1000]
+                }
+                
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP Error {e.response.status_code} for unit {clean_unit_id}: {e.response.text}")
+            
+            if e.response.status_code == 404:
+                return {
+                    "success": False,
+                    "status": 404,
+                    "message": f"Unit {clean_unit_id} not found",
+                    "unit_id": clean_unit_id
+                }
+            else:
+                return {
+                    "success": False,
+                    "status": e.response.status_code,
+                    "message": f"HTTP Error {e.response.status_code}",
+                    "error_details": e.response.text,
+                    "unit_id": clean_unit_id
+                }
+                
+        except Exception as e:
+            logger.error(f"Unexpected error fetching unit {clean_unit_id}: {e}")
+            return {
+                "success": False,
+                "message": f"Unexpected error: {str(e)}",
+                "unit_id": clean_unit_id
+            }
 
