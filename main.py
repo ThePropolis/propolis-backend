@@ -500,6 +500,73 @@ async def get_custom_occupancy(date_from: str, date_to: str):
     """Get occupancy rate for custom date range"""
     return await get_occupancy_rate(date_from, date_to)
 
+@app.post("/debug/clear-tables")
+async def clear_database_tables(tables: str = "pictures"):
+    """
+    Clear specified database tables for debugging.
+    tables parameter can be: 'pictures', 'listings', 'all'
+    """
+    try:
+        cleared_tables = []
+        
+        if tables in ["pictures", "all"]:
+            # Clear pictures table
+            result = supabase.from_("jd_listing_pictures").delete().neq("listing_id", "").execute()
+            cleared_tables.append(f"jd_listing_pictures ({len(result.data)} rows deleted)")
+        
+        if tables in ["listings", "all"]:
+            # Clear listings table
+            result = supabase.from_("jd_listing").delete().neq("id", "").execute()
+            cleared_tables.append(f"jd_listing ({len(result.data)} rows deleted)")
+        
+        if tables == "all":
+            # Also clear related tables
+            supabase.from_("jd_listing_integrations").delete().neq("listing_id", "").execute()
+            cleared_tables.append("jd_listing_integrations")
+        
+        return {
+            "message": "Tables cleared successfully",
+            "cleared_tables": cleared_tables,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to clear tables: {str(e)}")
+
+@app.get("/debug/database-state")
+async def debug_database_state():
+    """Debug endpoint to check database state for listings and pictures"""
+    try:
+        # Check listings
+        listings_res = supabase.from_("jd_listing").select("id, title").execute()
+        listings_count = len(listings_res.data) if listings_res.data else 0
+        
+        # Check pictures
+        pictures_res = supabase.from_("jd_listing_pictures").select("listing_id, full_url, thumbnail_url").execute()
+        pictures_count = len(pictures_res.data) if pictures_res.data else 0
+        
+        # Count unique listing IDs in pictures
+        unique_listing_ids = set()
+        pictures_by_listing = {}
+        
+        if pictures_res.data:
+            for pic in pictures_res.data:
+                listing_id = pic["listing_id"]
+                unique_listing_ids.add(listing_id)
+                if listing_id not in pictures_by_listing:
+                    pictures_by_listing[listing_id] = 0
+                pictures_by_listing[listing_id] += 1
+        
+        return {
+            "listings_count": listings_count,
+            "pictures_count": pictures_count,
+            "unique_listing_ids_in_pictures": len(unique_listing_ids),
+            "pictures_per_listing": pictures_by_listing,
+            "sample_listings": listings_res.data[:5] if listings_res.data else [],
+            "sample_pictures": pictures_res.data[:10] if pictures_res.data else []
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database debug failed: {str(e)}")
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
