@@ -138,6 +138,7 @@ async def get_guesty_revenue(
         "money.payments.amount",
         "money.payments.currency",
         "money.payments.paidAt",
+        "money.currency",
         "confirmationCode",
         "checkIn",
         "checkOut",
@@ -157,63 +158,12 @@ async def get_guesty_revenue(
         "accept": "application/json",
     }
     
-    params = {
-        "fields": " ".join(financial_fields),
-        "limit": 100,
-        "sort": "-createdAt"
-    }
-    
     # Try different filtering strategies (matching PHP format)
     filtering_strategies = []
     
     if start_date and end_date:
-        # Strategy 1: Filter by check-in date (matching PHP checkIn field)
+        # Strategy 1: Filter by check-in date with confirmed status
         strategy1 = [
-            {
-                "field": "checkIn",
-                "operator": "$gte", 
-                "value": start_date
-            },
-            {
-                "field": "checkIn",
-                "operator": "$lte", 
-                "value": end_date
-            }
-        ]
-        filtering_strategies.append(("checkIn_range", strategy1))
-        
-        # Strategy 2: Filter by check-out date (matching PHP checkOut field)  
-        strategy2 = [
-            {
-                "field": "checkOut",
-                "operator": "$gte", 
-                "value": start_date
-            },
-            {
-                "field": "checkOut",
-                "operator": "$lte", 
-                "value": end_date
-            }
-        ]
-        filtering_strategies.append(("checkOut_range", strategy2))
-        
-        # Strategy 3: Filter reservations that overlap with the date range
-        strategy3 = [
-            {
-                "field": "checkIn",
-                "operator": "$lte", 
-                "value": end_date
-            },
-            {
-                "field": "checkOut",
-                "operator": "$gte", 
-                "value": start_date
-            }
-        ]
-        filtering_strategies.append(("overlap_range", strategy3))
-        
-        # Strategy 4: Add status filter (matching PHP approach)
-        strategy4 = [
             {
                 "field": "checkIn",
                 "operator": "$gte", 
@@ -230,7 +180,50 @@ async def get_guesty_revenue(
                 "value": "confirmed"
             }
         ]
-        filtering_strategies.append(("checkIn_with_status", strategy4))
+        filtering_strategies.append(("checkIn_confirmed", strategy1))
+        
+        # Strategy 2: Filter reservations that overlap with the date range (confirmed only)
+        strategy2 = [
+            {
+                "field": "checkIn",
+                "operator": "$lte", 
+                "value": end_date
+            },
+            {
+                "field": "checkOut",
+                "operator": "$gte", 
+                "value": start_date
+            },
+            {
+                "field": "status",
+                "operator": "$eq", 
+                "value": "confirmed"
+            }
+        ]
+        filtering_strategies.append(("overlap_confirmed", strategy2))
+        
+        # Strategy 3: Filter by check-out date with confirmed status
+        strategy3 = [
+            {
+                "field": "checkOut",
+                "operator": "$gte", 
+                "value": start_date
+            },
+            {
+                "field": "checkOut",
+                "operator": "$lte", 
+                "value": end_date
+            },
+            {
+                "field": "status",
+                "operator": "$eq", 
+                "value": "confirmed"
+            }
+        ]
+        filtering_strategies.append(("checkOut_confirmed", strategy3))
+    
+    all_reservations = []
+    successful_strategy = None
     
     async with httpx.AsyncClient() as client:
         # Try each filtering strategy
@@ -238,22 +231,49 @@ async def get_guesty_revenue(
             try:
                 # Convert to proper JSON string (matching PHP format)
                 import json
-                params["filters"] = json.dumps(date_filter)
                 
                 print(f"DEBUG: Trying strategy: {strategy_name}")
-                print(f"DEBUG: Using date filter: {params['filters']}")
+                print(f"DEBUG: Using date filter: {json.dumps(date_filter)}")
                 print(f"DEBUG: Start date: {start_date}, End date: {end_date}")
                 
-                resp = await client.get(revenue_url, headers=headers, params=params)
-                resp.raise_for_status()
-                data = resp.json()
+                # Fetch all pages for this strategy
+                skip = 0
+                limit = 100
+                strategy_reservations = []
                 
-                print(f"DEBUG: Response status: {resp.status_code}")
-                print(f"DEBUG: Results count: {len(data.get('results', []))}")
+                while True:
+                    params = {
+                        "fields": " ".join(financial_fields),
+                        "limit": limit,
+                        "skip": skip,
+                        "sort": "-createdAt",
+                        "filters": json.dumps(date_filter)
+                    }
+                    
+                    resp = await client.get(revenue_url, headers=headers, params=params)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    
+                    batch_reservations = data.get('results', [])
+                    if not batch_reservations:
+                        break
+                    
+                    strategy_reservations.extend(batch_reservations)
+                    print(f"DEBUG: Strategy {strategy_name} - Fetched {len(batch_reservations)} reservations (total: {len(strategy_reservations)})")
+                    
+                    # If we got fewer than the limit, we've reached the end
+                    if len(batch_reservations) < limit:
+                        break
+                    
+                    skip += limit
+                
+                print(f"DEBUG: Strategy {strategy_name} returned {len(strategy_reservations)} total reservations")
                 
                 # If we got results, use this strategy
-                if data.get("results") and len(data["results"]) > 0:
-                    print(f"DEBUG: Strategy {strategy_name} returned {len(data['results'])} results")
+                if len(strategy_reservations) > 0:
+                    all_reservations = strategy_reservations
+                    successful_strategy = strategy_name
+                    print(f"DEBUG: Using strategy {strategy_name} with {len(all_reservations)} reservations")
                     break
                 else:
                     print(f"DEBUG: Strategy {strategy_name} returned no results, trying next...")
@@ -262,68 +282,121 @@ async def get_guesty_revenue(
                 print(f"DEBUG: Strategy {strategy_name} failed: {str(e)}")
                 continue
         else:
-            # If no strategies worked, try without date filter
+            # If no strategies worked, try without date filter but with pagination
             print("DEBUG: All date filtering strategies failed, trying without date filter...")
-            if "filters" in params:
-                del params["filters"]
-            resp = await client.get(revenue_url, headers=headers, params=params)
-            resp.raise_for_status()
-            data = resp.json()
+            
+            skip = 0
+            limit = 100
+            
+            while True:
+                params = {
+                    "fields": " ".join(financial_fields),
+                    "limit": limit,
+                    "skip": skip,
+                    "sort": "-createdAt"
+                }
+                
+                resp = await client.get(revenue_url, headers=headers, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+                
+                batch_reservations = data.get('results', [])
+                if not batch_reservations:
+                    break
+                
+                all_reservations.extend(batch_reservations)
+                
+                if len(batch_reservations) < limit:
+                    break
+                
+                skip += limit
+                
+                # Limit to reasonable number for fallback
+                if len(all_reservations) >= 1000:
+                    break
+            
+            successful_strategy = "no_filter_fallback"
     
     try:
-        print(f"DEBUG: Final response status: {resp.status_code}")
-        print(f"DEBUG: Final response data keys: {list(data.keys()) if isinstance(data, dict) else 'not_dict'}")
-        print(f"DEBUG: Final results count: {len(data.get('results', []))}")
+        print(f"DEBUG: Final strategy used: {successful_strategy}")
+        print(f"DEBUG: Total reservations fetched: {len(all_reservations)}")
         
-        # Calculate summary statistics
+        # Calculate summary statistics with improved revenue calculation
         total_revenue = 0
+        total_host_payout = 0
         total_paid = 0
         total_due = 0
         reservation_count = 0
+        revenue_by_currency = {}
         
-        if "results" in data:
-            for reservation in data["results"]:
-                print(f"DEBUG: Processing reservation: {reservation.get('confirmationCode', 'no_code')}")
-                print(f"DEBUG: Reservation status: {reservation.get('status', 'no_status')}")
-                print(f"DEBUG: Check-in date: {reservation.get('checkIn', 'no_date')}")
-                print(f"DEBUG: Check-out date: {reservation.get('checkOut', 'no_date')}")
+        for reservation in all_reservations:
+            print(f"DEBUG: Processing reservation: {reservation.get('confirmationCode', 'no_code')}")
+            print(f"DEBUG: Reservation status: {reservation.get('status', 'no_status')}")
+            print(f"DEBUG: Check-in date: {reservation.get('checkIn', 'no_date')}")
+            print(f"DEBUG: Check-out date: {reservation.get('checkOut', 'no_date')}")
+            
+            # Skip non-confirmed reservations if we're using fallback strategy
+            if successful_strategy == "no_filter_fallback" and reservation.get('status') != 'confirmed':
+                continue
+            
+            if "money" in reservation:
+                money = reservation["money"]
                 
-                if "money" in reservation:
-                    money = reservation["money"]
-                    host_payout = money.get("hostPayoutUsd", 0)
-                    total_paid_amount = money.get("totalPaid", 0)
-                    balance_due = money.get("balanceDue", 0)
-                    
-                    print(f"DEBUG: Host payout: {host_payout}, Total paid: {total_paid_amount}, Balance due: {balance_due}")
-                    
-                    total_revenue += host_payout
-                    total_paid += total_paid_amount
-                    total_due += balance_due
-                    reservation_count += 1
+                # Use multiple revenue sources for better accuracy
+                host_payout_usd = money.get("hostPayoutUsd", 0) or 0
+                host_payout = money.get("hostPayout", 0) or 0
+                total_paid_amount = money.get("totalPaid", 0) or 0
+                balance_due = money.get("balanceDue", 0) or 0
+                currency = money.get("currency", "USD")
+                
+                print(f"DEBUG: Host payout USD: {host_payout_usd}, Host payout: {host_payout}, Total paid: {total_paid_amount}, Balance due: {balance_due}, Currency: {currency}")
+                
+                # Prefer USD amounts, fall back to base amounts
+                revenue_amount = host_payout_usd if host_payout_usd > 0 else host_payout
+                
+                # If we still don't have host payout, use total paid as gross revenue
+                if revenue_amount <= 0:
+                    revenue_amount = total_paid_amount
+                
+                total_revenue += revenue_amount
+                total_host_payout += host_payout_usd
+                total_paid += total_paid_amount
+                total_due += balance_due
+                reservation_count += 1
+                
+                # Track revenue by currency
+                if currency not in revenue_by_currency:
+                    revenue_by_currency[currency] = 0
+                revenue_by_currency[currency] += revenue_amount
         
-        # Add summary to response
-        response_data = data
-        response_data["summary"] = {
-            "total_revenue_usd": total_revenue,
-            "total_paid_usd": total_paid,
-            "total_balance_due_usd": total_due,
-            "reservation_count": reservation_count,
-            "date_range": {
-                "start_date": start_date,
-                "end_date": end_date
-            } if start_date and end_date else None,
-            "debug_info": {
-                "filters_applied": bool(start_date and end_date),
-                "filter_string": params.get("filters", "none"),
-                "strategies_tried": [name for name, _ in filtering_strategies] if start_date and end_date else []
+        # Create comprehensive response
+        response_data = {
+            "results": all_reservations,
+            "count": len(all_reservations),
+            "summary": {
+                "total_revenue_usd": round(total_revenue, 2),
+                "total_host_payout_usd": round(total_host_payout, 2),
+                "total_paid_usd": round(total_paid, 2),
+                "total_balance_due_usd": round(total_due, 2),
+                "reservation_count": reservation_count,
+                "revenue_by_currency": revenue_by_currency,
+                "date_range": {
+                    "start_date": start_date,
+                    "end_date": end_date
+                } if start_date and end_date else None,
+                "debug_info": {
+                    "strategy_used": successful_strategy,
+                    "total_reservations_fetched": len(all_reservations),
+                    "filters_applied": bool(start_date and end_date)
+                }
             }
         }
         
         return response_data
         
-    except httpx.HTTPStatusError as e:
-        print(f"DEBUG: HTTP Error {e.response.status_code}: {e.response.text}")
-        raise HTTPException(status_code=502, detail="Failed to fetch revenue data") from e
+    except Exception as e:
+        print(f"DEBUG: Error in revenue calculation: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error calculating revenue: {str(e)}")
     
 
 
