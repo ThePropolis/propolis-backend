@@ -4,6 +4,7 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 import logging
+from database import supabase
 
 logging.basicConfig(
     level=logging.INFO,
@@ -13,6 +14,8 @@ logging.basicConfig(
 logger = logging.getLogger("app")
 
 load_dotenv()
+
+
 CLIENT_ID = os.getenv("GUESTY_CLIENT_ID")
 GUESTY_SECRET = os.getenv("GUESTY_SECRET")
 if not CLIENT_ID or not GUESTY_SECRET:
@@ -25,25 +28,28 @@ app = FastAPI(
 )
 
 
-
 class GuestyToken:
-    _token_cache = {
-        "access_token": None,
-        "expires_at": datetime.min.replace(tzinfo=timezone.utc)
-    } 
-
+    
     async def get_guesty_token(self) -> str:
         """
-        Return a cached token if still valid, otherwise fetch a new one
-        and update the cache.
+        Return a cached token from Supabase if still valid, otherwise fetch a new one
+        and update the cache in Supabase.
         """
         now = datetime.now(timezone.utc)
         logger.info("Checking Guesty token validity...")
         
-        # Check if we have a valid cached token
-        if self._token_cache["access_token"] and now < self._token_cache["expires_at"]:
-            logger.info("Using cached Guesty token")
-            return self._token_cache["access_token"]
+        # Check if we have a valid cached token in Supabase
+        try:
+            result = supabase.from_("jd_guesty_tokens").select("*").eq("id", 1).single().execute()
+            if result.data:
+                token_data = result.data
+                expires_at = datetime.fromisoformat(token_data["expires_at"].replace("Z", "+00:00"))
+                
+                if token_data["access_token"] and now < expires_at:
+                    logger.info("Using cached Guesty token from Supabase")
+                    return token_data["access_token"]
+        except Exception as e:
+            logger.info(f"No cached token found in Supabase or error retrieving: {e}")
         
         logger.info("Fetching new Guesty token...")
         token_url = "https://open-api.guesty.com/oauth2/token"
@@ -70,9 +76,21 @@ class GuestyToken:
         if not access_token:
             raise HTTPException(status_code=502, detail="No access_token in Guesty response")
 
-        # Cache it, subtracting a safety window (30 minutes)
-        self._token_cache["access_token"] = access_token
-        self._token_cache["expires_at"] = now + timedelta(seconds=expires_in - 1800)
+        # Cache it in Supabase, subtracting a safety window (30 minutes)
+        expires_at = now + timedelta(seconds=expires_in - 1800)
         
-        logger.info(f"Successfully obtained new Guesty token, expires at: {self._token_cache['expires_at']}")
+        try:
+            # Upsert the token data (insert or update if id=1 exists)
+            supabase.from_("jd_guesty_tokens").upsert({
+                "id": 1,
+                "access_token": access_token,
+                "expires_at": expires_at.isoformat(),
+                "created_at": now.isoformat(),
+                "updated_at": now.isoformat()
+            }).execute()
+            logger.info(f"Successfully cached new Guesty token in Supabase, expires at: {expires_at}")
+        except Exception as e:
+            logger.error(f"Failed to cache token in Supabase: {e}")
+            # Continue anyway, as we still have the token to return
+        
         return access_token

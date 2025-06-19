@@ -63,6 +63,7 @@ app.include_router(doorloop_router)
  
 @app.get("/")
 async def welcome():
+    await token.get_guesty_token()
     return "Hello, welcome to the Propolis Backend"
 
 @app.get("/api/guesty/listings")
