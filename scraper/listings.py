@@ -61,18 +61,36 @@ async def sync_guesty_listings(token: str = Depends(token_gen.get_guesty_token))
 def process_related_data(listings: List[Dict[str, Any]]) -> None:
     # Pictures
     pics = []
-    for lst in listings:
+    print(f"DEBUG: Processing {len(listings)} listings for pictures")
+    
+    for lst_idx, lst in enumerate(listings):
         lid = lst["_id"]
-        for idx, pic in enumerate(lst.get("pictures", [])):
-            pics.append({
+        pictures = lst.get("pictures", [])
+        print(f"DEBUG: Listing {lst_idx + 1}/{len(listings)} - ID: {lid}, Pictures: {len(pictures)}")
+        
+        for idx, pic in enumerate(pictures):
+            pic_data = {
                 "listing_id": lid,
                 "thumbnail_url": pic.get("thumbnail", ""),
                 "full_url": pic.get("original", ""),
                 "caption": pic.get("description", ""),
                 "display_order": idx,
-            })
+            }
+            pics.append(pic_data)
+            print(f"DEBUG: Added picture {idx + 1} for listing {lid}: thumbnail={bool(pic.get('thumbnail'))}, original={bool(pic.get('original'))}")
+    
+    print(f"DEBUG: Total pictures to insert: {len(pics)}")
+    print(f"DEBUG: Unique listing IDs: {len(set(pic['listing_id'] for pic in pics))}")
+    
     if pics:
+        # Show first few pictures for debugging
+        for i, pic in enumerate(pics[:5]):
+            print(f"DEBUG: Picture {i + 1}: listing_id={pic['listing_id']}, has_full_url={bool(pic['full_url'])}")
+        
         supabase.from_("jd_listing_pictures").upsert(pics).execute()
+        print(f"DEBUG: Successfully inserted {len(pics)} pictures")
+    else:
+        print("DEBUG: No pictures found to insert")
 
     # Integrations
     ints = []
@@ -87,8 +105,6 @@ def process_related_data(listings: List[Dict[str, Any]]) -> None:
             })
     if ints:
         supabase.from_("jd_listing_integrations").upsert(ints).execute()
-
-
 
 def normalize_guesty_record(raw: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -151,6 +167,7 @@ def normalize_guesty_record(raw: Dict[str, Any]) -> Dict[str, Any]:
         
         # Main Thumbnail
         "thumbnail_url": raw.get("picture", {}).get("thumbnail", ""),
+        
         
         # Pricing
         "base_price": prices.get("basePrice", 0),
