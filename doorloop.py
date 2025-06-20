@@ -1050,8 +1050,8 @@ async def get_units(
     property_id: str = None,
     status: str = None,
     unit_type: str = None,
-    limit: int = 100,
-    page: int = 1
+    page: int = 1,
+    fetch_all: bool = False
 ):
     """Get units from Doorloop API with optional filtering.
     
@@ -1059,17 +1059,18 @@ async def get_units(
         property_id: Filter by specific property ID
         status: Filter by unit status (e.g., 'available', 'occupied', 'maintenance')
         unit_type: Filter by unit type
-        limit: Number of units per page (default: 100, max: 500)
-        page: Page number (default: 1)
+        page: Page number (default: 1) - Note: Doorloop controls page size
+        fetch_all: If True, fetches all pages and returns combined results
     """
     units_url = f"{DOORLOOP_BASE_URL}/units"
     headers = get_doorloop_headers()
     
-    # Build query parameters
-    params = {
-        "limit": min(limit, 500),  # Cap at 500 to prevent overload
-        "page": page
-    }
+    # Build query parameters (Doorloop controls pagination)
+    params = {}
+    
+    # Add page parameter (let Doorloop control page size)
+    if not fetch_all:
+        params["page"] = page
     
     # Add optional filters
     if property_id:
@@ -1081,140 +1082,214 @@ async def get_units(
     
     logger.info(f"Making request to: {units_url} with params: {params}")
     
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.get(units_url, headers=headers, params=params)
-            
-            # Log response details for debugging
-            logger.info(f"Units API response status: {resp.status_code}")
-            logger.info(f"Units API response headers: {dict(resp.headers)}")
-            
-            resp.raise_for_status()
-            
-            # Check if response has content
-            if not resp.content:
-                logger.warning("Empty response from Doorloop units API")
-                return {
-                    "success": True,
-                    "message": "No units data available", 
-                    "data": [],
-                    "pagination": {
-                        "page": page,
-                        "limit": limit,
-                        "total": 0
-                    },
-                    "filters_applied": {
-                        "property_id": property_id,
-                        "status": status,
-                        "unit_type": unit_type
-                    }
-                }
-            
-            # Check content type
-            content_type = resp.headers.get("content-type", "")
-            logger.info(f"Response content type: {content_type}")
-            
-            # Check if we got HTML (login page) instead of JSON
-            if "text/html" in content_type:
-                logger.warning("Received HTML response (likely login page)")
-                return {
-                    "success": False,
-                    "message": "Received HTML response (likely login page)",
-                    "content_type": content_type,
-                    "suggestion": "This endpoint may not exist or requires different authentication"
-                }
-            
-            # Try to parse JSON
-            try:
-                data = resp.json()
-                units = data.get('data', [])
-                total_count = data.get('total', len(units))
+    if fetch_all:
+        # Fetch all pages
+        all_units = []
+        current_page = 1
+        total_count = 0
+        
+        async with httpx.AsyncClient() as client:
+            while True:
+                page_params = {**params, "page": current_page}
                 
-                logger.info(f"Successfully fetched {len(units)} units from Doorloop (page {page})")
-                
-                # Calculate pagination info
-                total_pages = (total_count + limit - 1) // limit  # Ceiling division
-                has_next = page < total_pages
-                has_prev = page > 1
-                
-                return {
-                    "success": True,
-                    "data": units,
-                    "pagination": {
-                        "page": page,
-                        "limit": limit,
-                        "total": total_count,
-                        "total_pages": total_pages,
-                        "has_next": has_next,
-                        "has_prev": has_prev,
-                        "next_page": page + 1 if has_next else None,
-                        "prev_page": page - 1 if has_prev else None
-                    },
-                    "filters_applied": {
-                        "property_id": property_id,
-                        "status": status,
-                        "unit_type": unit_type
-                    },
-                    "summary": {
-                        "units_on_page": len(units),
-                        "total_units": total_count
-                    }
-                }
-                
-            except ValueError as json_error:
-                logger.error(f"Failed to parse JSON response: {json_error}")
-                logger.error(f"Response content preview: {resp.text[:500]}")
-                return {
-                    "success": False,
-                    "message": "Units data received but not in JSON format",
-                    "content_type": content_type,
-                    "raw_response": resp.text[:1000]  # First 1000 chars for debugging
-                }
-                
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP Error {e.response.status_code} for units: {e.response.text}")
-            
-            if e.response.status_code == 400:
                 try:
-                    error_data = e.response.json()
-                    return {
-                        "success": False,
-                        "status": 400,
-                        "message": "Bad Request - Invalid parameters",
-                        "error_details": error_data,
-                        "parameters_sent": params,
-                        "suggestion": "Check if the filter parameters are valid"
-                    }
-                except:
-                    return {
-                        "success": False,
-                        "status": 400,
-                        "message": "Bad Request",
-                        "error_text": e.response.text,
-                        "parameters_sent": params
-                    }
-            elif e.response.status_code == 404:
-                return {
-                    "success": False,
-                    "status": 404,
-                    "message": "Units endpoint not found",
-                    "suggestion": "The /units endpoint may not be available in your Doorloop plan"
-                }
-            else:
-                return {
-                    "success": False,
-                    "status": e.response.status_code,
-                    "message": f"HTTP Error {e.response.status_code}",
-                    "error_details": e.response.text
-                }
-                
-        except Exception as e:
-            logger.error(f"Unexpected error fetching units: {e}")
-            return {
-                "success": False,
-                "message": f"Unexpected error: {str(e)}",
-                "error_type": type(e).__name__
+                    logger.info(f"Fetching page {current_page}")
+                    resp = await client.get(units_url, headers=headers, params=page_params)
+                    resp.raise_for_status()
+                    
+                    if not resp.content:
+                        break
+                    
+                    data = resp.json()
+                    page_units = data.get('data', [])
+                    
+                    if not page_units:
+                        break
+                    
+                    all_units.extend(page_units)
+                    total_count = data.get('total', len(all_units))
+                    
+                    logger.info(f"Page {current_page}: {len(page_units)} units (total so far: {len(all_units)})")
+                    
+                    # Check if this is the last page
+                    if len(page_units) < 50:  # Doorloop's apparent page size
+                        break
+                    
+                    current_page += 1
+                    
+                except Exception as e:
+                    logger.error(f"Error fetching page {current_page}: {e}")
+                    break
+        
+        return {
+            "success": True,
+            "data": all_units,
+            "pagination": {
+                "fetch_all": True,
+                "total_pages_fetched": current_page,
+                "total_units": len(all_units),
+                "doorloop_reported_total": total_count
+            },
+            "filters_applied": {
+                "property_id": property_id,
+                "status": status,
+                "unit_type": unit_type
+            },
+            "summary": {
+                "total_units_fetched": len(all_units)
             }
+        }
+    
+    else:
+        # Single page request
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.get(units_url, headers=headers, params=params)
+                
+                # Log response details for debugging
+                logger.info(f"Units API response status: {resp.status_code}")
+                logger.info(f"Units API response headers: {dict(resp.headers)}")
+                
+                resp.raise_for_status()
+                
+                # Check if response has content
+                if not resp.content:
+                    logger.warning("Empty response from Doorloop units API")
+                    return {
+                        "success": True,
+                        "message": "No units data available", 
+                        "data": [],
+                        "pagination": {
+                            "page": page,
+                            "units_on_page": 0,
+                            "total": 0,
+                            "note": "Doorloop controls pagination - actual page size may vary"
+                        },
+                        "filters_applied": {
+                            "property_id": property_id,
+                            "status": status,
+                            "unit_type": unit_type
+                        }
+                    }
+                
+                # Check content type
+                content_type = resp.headers.get("content-type", "")
+                logger.info(f"Response content type: {content_type}")
+                
+                # Check if we got HTML (login page) instead of JSON
+                if "text/html" in content_type:
+                    logger.warning("Received HTML response (likely login page)")
+                    return {
+                        "success": False,
+                        "message": "Received HTML response (likely login page)",
+                        "content_type": content_type,
+                        "suggestion": "This endpoint may not exist or requires different authentication"
+                    }
+                
+                # Try to parse JSON
+                try:
+                    data = resp.json()
+                    units = data.get('data', [])
+                    total_count = data.get('total', 0)
+                    
+                    # Doorloop's actual page size (discovered from response)
+                    actual_page_size = len(units)
+                    
+                    logger.info(f"Successfully fetched {len(units)} units from Doorloop (page {page})")
+                    logger.info(f"Doorloop's actual page size: {actual_page_size}")
+                    logger.info(f"Doorloop reported total: {total_count}")
+                    
+                    # Calculate pagination info based on Doorloop's actual behavior
+                    estimated_page_size = 50  # Doorloop's apparent default
+                    if total_count > 0:
+                        estimated_total_pages = (total_count + estimated_page_size - 1) // estimated_page_size
+                        has_next = page < estimated_total_pages
+                        has_prev = page > 1
+                    else:
+                        estimated_total_pages = 1
+                        has_next = actual_page_size >= estimated_page_size  # Might have more if page is full
+                        has_prev = page > 1
+                    
+                    return {
+                        "success": True,
+                        "data": units,
+                        "pagination": {
+                            "page": page,
+                            "units_on_page": actual_page_size,
+                            "total": total_count,
+                            "estimated_total_pages": estimated_total_pages,
+                            "has_next": has_next,
+                            "has_prev": has_prev,
+                            "next_page": page + 1 if has_next else None,
+                            "prev_page": page - 1 if has_prev else None,
+                            "doorloop_page_size": actual_page_size,
+                            "note": "Doorloop controls pagination - page size is determined by Doorloop API"
+                        },
+                        "filters_applied": {
+                            "property_id": property_id,
+                            "status": status,
+                            "unit_type": unit_type
+                        },
+                        "summary": {
+                            "units_on_page": actual_page_size,
+                            "total_units": total_count
+                        }
+                    }
+                    
+                except ValueError as json_error:
+                    logger.error(f"Failed to parse JSON response: {json_error}")
+                    logger.error(f"Response content preview: {resp.text[:500]}")
+                    return {
+                        "success": False,
+                        "message": "Units data received but not in JSON format",
+                        "content_type": content_type,
+                        "raw_response": resp.text[:1000]
+                    }
+                    
+            except httpx.HTTPStatusError as e:
+                logger.error(f"HTTP Error {e.response.status_code} for units: {e.response.text}")
+                
+                if e.response.status_code == 400:
+                    try:
+                        error_data = e.response.json()
+                        return {
+                            "success": False,
+                            "status": 400,
+                            "message": "Bad Request - Invalid parameters",
+                            "error_details": error_data,
+                            "parameters_sent": params,
+                            "suggestion": "Check if the filter parameters are valid"
+                        }
+                    except:
+                        return {
+                            "success": False,
+                            "status": 400,
+                            "message": "Bad Request",
+                            "error_text": e.response.text,
+                            "parameters_sent": params
+                        }
+                elif e.response.status_code == 404:
+                    return {
+                        "success": False,
+                        "status": 404,
+                        "message": "Units endpoint not found",
+                        "suggestion": "The /units endpoint may not be available in your Doorloop plan"
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "status": e.response.status_code,
+                        "message": f"HTTP Error {e.response.status_code}",
+                        "error_details": e.response.text
+                    }
+                    
+            except Exception as e:
+                logger.error(f"Unexpected error fetching units: {e}")
+                return {
+                    "success": False,
+                    "message": f"Unexpected error: {str(e)}",
+                    "error_type": type(e).__name__
+                }
 
 @router.get("/units/{unit_id}")
 async def get_unit_by_id(unit_id: str):
