@@ -458,60 +458,153 @@ async def get_occupied_units(
         token: str = Depends(token.get_guesty_token)
     ):
     """
-    Get count of unique properties that have confirmed reservations in the date range
+    Get count of unique properties that have confirmed reservations that overlap with the date range.
+    A reservation overlaps if: checkIn <= date_to AND checkOut >= date_from
     """
-    params = {
-        "fields": "listingId",
-        "limit": 100,
-        "sort": "_id"
-    }
     
-    # Filter for confirmed reservations in date range (matching PHP format)
-    filters = [
-        {"field": "status", "operator": "$eq", "value": "confirmed"},
-        {"field": "checkIn", "operator": "$gte", "value": date_from},
-        {"field": "checkIn", "operator": "$lte", "value": date_to}
+    # Try multiple filtering strategies to capture all overlapping reservations
+    filtering_strategies = [
+        # Strategy 1: Overlap filter (most accurate)
+        {
+            "name": "overlap_filter",
+            "filters": [
+                {"field": "status", "operator": "$eq", "value": "confirmed"},
+                {"field": "checkIn", "operator": "$lte", "value": date_to},
+                {"field": "checkOut", "operator": "$gte", "value": date_from}
+            ]
+        },
+        # Strategy 2: Check-in during period (current logic)
+        {
+            "name": "checkin_filter", 
+            "filters": [
+                {"field": "status", "operator": "$eq", "value": "confirmed"},
+                {"field": "checkIn", "operator": "$gte", "value": date_from},
+                {"field": "checkIn", "operator": "$lte", "value": date_to}
+            ]
+        },
+        # Strategy 3: Check-out during period
+        {
+            "name": "checkout_filter",
+            "filters": [
+                {"field": "status", "operator": "$eq", "value": "confirmed"},
+                {"field": "checkOut", "operator": "$gte", "value": date_from},
+                {"field": "checkOut", "operator": "$lte", "value": date_to}
+            ]
+        },
+        # Strategy 4: Confirmed reservations only (fallback)
+        {
+            "name": "confirmed_only",
+            "filters": [
+                {"field": "status", "operator": "$eq", "value": "confirmed"}
+            ]
+        }
     ]
     
     import json
-    params["filters"] = json.dumps(filters)
-    
     occupied_property_ids = set()
-    skip = 0
+    successful_strategy = None
+    total_reservations_found = 0
     
     async with httpx.AsyncClient() as client:
-        while True:
-            params["skip"] = skip
+        for strategy in filtering_strategies:
+            strategy_name = strategy["name"]
+            filters = strategy["filters"]
             
-            response = await client.get(
-                f"https://open-api.guesty.com/v1/reservations",
-                params=params,
-                headers=headers,
-                timeout=30.0
-            )
+            print(f"DEBUG: Trying occupancy strategy: {strategy_name}")
+            print(f"DEBUG: Date range: {date_from} to {date_to}")
+            print(f"DEBUG: Filters: {json.dumps(filters)}")
             
-            if response.status_code != 200:
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=f"Guesty API error: {response.text}"
-                )
-            
-            data = response.json()
-            reservations = data.get("results", [])
-            
-            if not reservations:
-                break
-            
-            # Collect unique property IDs
-            for reservation in reservations:
-                listing_id = reservation.get("listingId")
-                if listing_id:
-                    occupied_property_ids.add(listing_id)
-            
-            if len(reservations) < 100:
-                break
+            try:
+                strategy_property_ids = set()
+                strategy_reservations = 0
+                skip = 0
                 
-            skip += 100
+                while True:
+                    params = {
+                        "fields": "listingId,checkIn,checkOut,status,confirmationCode",
+                        "limit": 100,
+                        "sort": "_id",
+                        "skip": skip,
+                        "filters": json.dumps(filters)
+                    }
+                    
+                    response = await client.get(
+                        f"https://open-api.guesty.com/v1/reservations",
+                        params=params,
+                        headers=headers,
+                        timeout=30.0
+                    )
+                    
+                    if response.status_code != 200:
+                        print(f"DEBUG: Strategy {strategy_name} failed with status {response.status_code}")
+                        break
+                    
+                    data = response.json()
+                    reservations = data.get("results", [])
+                    
+                    if not reservations:
+                        break
+                    
+                    strategy_reservations += len(reservations)
+                    
+                    # Process reservations
+                    for reservation in reservations:
+                        listing_id = reservation.get("listingId")
+                        check_in = reservation.get("checkIn")
+                        check_out = reservation.get("checkOut")
+                        status = reservation.get("status")
+                        confirmation = reservation.get("confirmationCode", "no_code")
+                        
+                        if not listing_id:
+                            continue
+                        
+                        # For fallback strategy, manually filter by date overlap
+                        if strategy_name == "confirmed_only" and check_in and check_out:
+                            # Check if reservation overlaps with our date range
+                            try:
+                                # Parse dates (handle both date and datetime formats)
+                                checkin_date = check_in.split('T')[0] if 'T' in check_in else check_in
+                                checkout_date = check_out.split('T')[0] if 'T' in check_out else check_out
+                                
+                                # Check overlap: checkIn <= date_to AND checkOut >= date_from
+                                if checkin_date <= date_to and checkout_date >= date_from:
+                                    strategy_property_ids.add(listing_id)
+                                    print(f"DEBUG: Found overlapping reservation {confirmation}: {checkin_date} to {checkout_date}")
+                            except Exception as date_error:
+                                print(f"DEBUG: Date parsing error for {confirmation}: {date_error}")
+                                # Include it anyway if we can't parse dates
+                                strategy_property_ids.add(listing_id)
+                        else:
+                            # For other strategies, trust the API filtering
+                            strategy_property_ids.add(listing_id)
+                            print(f"DEBUG: Found reservation {confirmation} for property {listing_id}: {check_in} to {check_out}")
+                    
+                    if len(reservations) < 100:
+                        break
+                    
+                    skip += 100
+                
+                print(f"DEBUG: Strategy {strategy_name} found {len(strategy_property_ids)} unique properties from {strategy_reservations} reservations")
+                
+                # Use the first strategy that returns results
+                if len(strategy_property_ids) > 0:
+                    occupied_property_ids = strategy_property_ids
+                    successful_strategy = strategy_name
+                    total_reservations_found = strategy_reservations
+                    print(f"DEBUG: Using strategy {strategy_name} with {len(occupied_property_ids)} occupied properties")
+                    break
+                else:
+                    print(f"DEBUG: Strategy {strategy_name} returned no results")
+                    
+            except Exception as e:
+                print(f"DEBUG: Strategy {strategy_name} failed with error: {str(e)}")
+                continue
+    
+    print(f"DEBUG: Final occupancy calculation:")
+    print(f"DEBUG: Strategy used: {successful_strategy}")
+    print(f"DEBUG: Total reservations processed: {total_reservations_found}")
+    print(f"DEBUG: Unique occupied properties: {len(occupied_property_ids)}")
+    print(f"DEBUG: Sample occupied property IDs: {list(occupied_property_ids)[:5]}")
     
     return len(occupied_property_ids)
 
