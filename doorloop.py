@@ -37,8 +37,9 @@ async def get_doorloop_properties():
         try:
             resp = await client.get(properties_url, headers=headers)
             resp.raise_for_status()
-            logger.info(f"Successfully fetched {len(resp.json().get('data', []))} properties from Doorloop")
-            return resp.json()
+            data = resp.json()
+            logger.info(f"Successfully fetched {len(data.get('data', []))} properties from Doorloop")
+            return data
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP Error {e.response.status_code}: {e.response.text}")
             raise HTTPException(status_code=502, detail=f"Failed to fetch properties from Doorloop: {e.response.status_code}") from e

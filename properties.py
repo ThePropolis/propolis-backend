@@ -203,22 +203,31 @@ def get_reservations() -> List[Dict]:
     if not listings_res.data:
         return []
     
-    # For each listing, fetch its pictures and replace thumbnail with full-size images
+    # Fetch ALL pictures in a single query instead of N+1 queries
+    all_pictures_res = (
+        supabase
+        .table("jd_listing_pictures")
+        .select("listing_id, full_url, thumbnail_url, caption, display_order")
+        .order("listing_id, display_order")
+        .execute()
+    )
+    
+    # Group pictures by listing_id
+    pictures_by_listing = {}
+    if all_pictures_res.data:
+        for pic in all_pictures_res.data:
+            listing_id = pic["listing_id"]
+            if listing_id not in pictures_by_listing:
+                pictures_by_listing[listing_id] = []
+            pictures_by_listing[listing_id].append(pic)
+    
+    # Add pictures to each listing
     for listing in listings_res.data:
-        # Fetch pictures for this listing
-        pictures_res = (
-            supabase
-            .table("jd_listing_pictures")
-            .select("full_url, thumbnail_url, caption, display_order")
-            .eq("listing_id", listing["id"])
-            .order("display_order")
-            .execute()
-        )
+        listing_pictures = pictures_by_listing.get(listing["id"], [])
         
-        # Add full-size pictures array to the listing
-        if pictures_res.data:
+        if listing_pictures:
             # Use full_url (original quality) instead of thumbnail
-            listing["pictures"] = [pic["full_url"] for pic in pictures_res.data if pic["full_url"]]
+            listing["pictures"] = [pic["full_url"] for pic in listing_pictures if pic["full_url"]]
         else:
             # Fallback to thumbnail_url if no pictures found
             listing["pictures"] = [listing["thumbnail_url"]] if listing.get("thumbnail_url") else []
