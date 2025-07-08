@@ -1,3 +1,4 @@
+from collections import defaultdict
 from datetime import datetime, timedelta
 import logging
 from typing import Optional
@@ -543,10 +544,474 @@ async def get_doorloop_profit_and_loss(
                 "message": str(e)
             }
 
+def lease_overlaps_date_range(lease, start_date, end_date):
+    """
+    Check if a lease overlaps with the given date range.
+    Implements the same logic as the PHP code:
+    - Lease starts within the date range, OR
+    - Lease ends within the date range, OR  
+    - Lease spans across the entire date range
+    """
+    
+    # Try different possible date field names
+    lease_start = (lease.get('leaseStartDate') or 
+                   lease.get('startDate') or 
+                   lease.get('start_date') or
+                   lease.get('lease_start_date'))
+    
+    lease_end = (lease.get('leaseEndDate') or 
+                 lease.get('endDate') or 
+                 lease.get('end_date') or
+                 lease.get('lease_end_date'))
+    
+    if not lease_start:
+        logger.debug(f"Lease missing start date - available fields: {list(lease.keys())}")
+        return False
+    
+    try:
+        # Normalize date formats (handle ISO dates, timestamps, etc.)
+        def normalize_date(date_str):
+            if not date_str:
+                return None
+            
+            # Handle ISO format with timestamp (2024-05-01T00:00:00Z)
+            if 'T' in date_str:
+                date_str = date_str.split('T')[0]
+            
+            # Handle different date separators and formats
+            # Convert to YYYY-MM-DD format for comparison
+            if len(date_str) == 10 and '-' in date_str:
+                # Already in YYYY-MM-DD format
+                return date_str
+            elif '/' in date_str:
+                # Handle MM/DD/YYYY or DD/MM/YYYY format
+                parts = date_str.split('/')
+                if len(parts) == 3:
+                    # Assume MM/DD/YYYY for now (most common)
+                    month, day, year = parts
+                    return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+            
+            return date_str
+        
+        lease_start_normalized = normalize_date(lease_start)
+        lease_end_normalized = normalize_date(lease_end) if lease_end else None
+        
+        if not lease_start_normalized:
+            logger.debug(f"Could not normalize lease start date: {lease_start}")
+            return False
+        
+        # Debug logging for first few comparisons
+        if hasattr(lease_overlaps_date_range, '_debug_count'):
+            lease_overlaps_date_range._debug_count += 1
+        else:
+            lease_overlaps_date_range._debug_count = 1
+        
+        if lease_overlaps_date_range._debug_count <= 3:
+            logger.info(f"🔍 Date comparison #{lease_overlaps_date_range._debug_count}:")
+            logger.info(f"   Query range: {start_date} to {end_date}")
+            logger.info(f"   Lease dates: {lease_start_normalized} to {lease_end_normalized}")
+        
+        # Check overlap conditions (same as PHP logic)
+        # 1. Lease starts within the date range
+        if start_date <= lease_start_normalized <= end_date:
+            if lease_overlaps_date_range._debug_count <= 3:
+                logger.info(f"   ✅ Match: Lease starts within range")
+            return True
+        
+        # 2. Lease ends within the date range (if end date exists)
+        if lease_end_normalized and start_date <= lease_end_normalized <= end_date:
+            if lease_overlaps_date_range._debug_count <= 3:
+                logger.info(f"   ✅ Match: Lease ends within range")
+            return True
+        
+        # 3. Lease spans across the entire date range
+        if lease_end_normalized and lease_start_normalized < start_date and lease_end_normalized > end_date:
+            if lease_overlaps_date_range._debug_count <= 3:
+                logger.info(f"   ✅ Match: Lease spans entire range")
+            return True
+        
+        # 4. For at-will leases (no end date) that started before the range end
+        if not lease_end_normalized and lease_start_normalized <= end_date:
+            if lease_overlaps_date_range._debug_count <= 3:
+                logger.info(f"   ✅ Match: At-will lease overlaps")
+            return True
+        
+        # No match
+        if lease_overlaps_date_range._debug_count <= 3:
+            logger.info(f"   ❌ No match")
+        return False
+        
+    except Exception as e:
+        logger.debug(f"Error parsing lease dates: {e}")
+        logger.debug(f"  lease_start: {lease_start}")
+        logger.debug(f"  lease_end: {lease_end}")
+        # If we can't parse dates, include the lease to be safe
+        return True
+
+async def get_total_units_property(headers, property_id):
+    """Get total number of units for a specific property"""
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            logger.info(f"Fetching units for property {property_id}")
+            
+            # Try property-specific units endpoint first
+            property_units_url = f"{DOORLOOP_BASE_URL}/properties/{property_id}/units"
+            response = await client.get(
+                property_units_url,
+                headers=headers,
+                params={"limit": 1000}
+            )
+            
+            logger.info(f"Property units response status: {response.status_code}")
+            
+            if response.status_code == 200 and response.content:
+                content_type = response.headers.get("content-type", "")
+                if "text/html" not in content_type:
+                    try:
+                        units_data = response.json()
+                        units = units_data.get("data", [])
+                        total_units = len(units)
+                        logger.info(f"Found {total_units} units for property {property_id} via property endpoint")
+                        return total_units
+                    except Exception as json_error:
+                        logger.error(f"Failed to parse property units JSON: {json_error}")
+            
+            # Fallback: Use general units endpoint with property filter
+            logger.info(f"Trying general units endpoint with property filter")
+            general_units_url = f"{DOORLOOP_BASE_URL}/units"
+            
+            total_units = 0
+            page = 1
+            max_pages = 20
+            
+            while page <= max_pages:
+                response = await client.get(
+                    general_units_url,
+                    headers=headers,
+                    params={
+                        "property_id": property_id,
+                        "page": page
+                    }
+                )
+                
+                if response.status_code != 200 or not response.content:
+                    break
+                
+                content_type = response.headers.get("content-type", "")
+                if "text/html" in content_type:
+                    break
+                
+                try:
+                    units_data = response.json()
+                    units = units_data.get("data", [])
+                    
+                    if not units:
+                        break
+                    
+                    total_units += len(units)
+                    logger.info(f"Property {property_id} - Page {page}: {len(units)} units (total: {total_units})")
+                    
+                    # Check if this is the last page
+                    if len(units) < 50:  # Doorloop's typical page size
+                        break
+                    
+                    page += 1
+                    
+                except Exception as json_error:
+                    logger.error(f"Failed to parse units JSON on page {page}: {json_error}")
+                    break
+            
+            if total_units > 0:
+                logger.info(f"Found {total_units} units for property {property_id} via general endpoint")
+                return total_units
+            
+            # Last resort: Check if property has unit count field
+            logger.info(f"Checking property data for unit count")
+            property_response = await client.get(
+                f"{DOORLOOP_BASE_URL}/properties/{property_id}",
+                headers=headers
+            )
+            
+            if property_response.status_code == 200 and property_response.content:
+                try:
+                    property_data = property_response.json()
+                    property_info = property_data.get("data", {}) if isinstance(property_data.get("data"), dict) else property_data
+                    
+                    # Look for unit count fields
+                    unit_count_fields = ["unitCount", "unit_count", "numberOfUnits", "unitsCount", "totalUnits"]
+                    for field in unit_count_fields:
+                        if field in property_info and isinstance(property_info[field], (int, float)):
+                            total_units = int(property_info[field])
+                            logger.info(f"Found {total_units} units for property {property_id} from {field} field")
+                            return total_units
+                            
+                except Exception as json_error:
+                    logger.error(f"Failed to parse property JSON: {json_error}")
+            
+            logger.warning(f"No units found for property {property_id}")
+            return 0
+            
+        except Exception as e:
+            logger.error(f"Error in get_total_units_property for property {property_id}: {str(e)}")
+            raise
+
+
+async def get_occupied_units_property(headers, property_id, date_from, date_to):
+    """Get number of occupied units for a specific property based on active leases"""
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            logger.info(f"🏢 Fetching occupied units for property {property_id} from {date_from} to {date_to}")
+            
+            # Get leases for the specific property
+            leases_url = f"{DOORLOOP_BASE_URL}/leases"
+            
+            # Try different API filtering strategies for property-specific leases
+            api_strategies = [
+                {
+                    "name": "property_and_date_filter",
+                    "params": {
+                        "filter_property": property_id,
+                        "filter_date_from": date_from,
+                        "filter_date_to": date_to,
+                        "filter_status": "active"
+                    }
+                }
+            ]
+            
+            leases_data = None
+            successful_strategy = None
+            
+            for strategy in api_strategies:
+                strategy_name = strategy["name"]
+                base_params = strategy["params"]
+                
+                logger.info(f"🔍 Trying strategy: {strategy_name} for property {property_id}")
+                logger.info(f"   📋 Params: {base_params}")
+                
+                strategy_leases = []
+                page = 1
+                max_pages = 20
+                
+                while page <= max_pages:
+                    page_params = {**base_params, "page": page}
+                    
+                    try:
+                        response = await client.get(leases_url, headers=headers, params=page_params)
+                        
+                        logger.info(f"   📡 API Response: status={response.status_code}, content_length={len(response.content) if response.content else 0}")
+                        
+                        if response.status_code != 200:
+                            logger.warning(f"   ❌ Strategy {strategy_name} failed with status {response.status_code}")
+                            logger.warning(f"   Response: {response.text[:200]}")
+                            break
+                        
+                        if not response.content:
+                            logger.info(f"   ⚠️ Empty response on page {page}")
+                            break
+                        
+                        content_type = response.headers.get("content-type", "")
+                        if "text/html" in content_type:
+                            logger.warning(f"   ❌ Got HTML response (likely login page)")
+                            break
+                        
+                        try:
+                            data = response.json()
+                        except Exception as json_error:
+                            logger.error(f"   ❌ JSON parsing error for strategy {strategy_name}: {json_error}")
+                            logger.error(f"   Raw response: {response.text[:300]}")
+                            break
+                        
+                        page_leases = data.get('data', [])
+                        
+                        if not page_leases:
+                            logger.info(f"   📭 No leases on page {page}")
+                            break
+                        
+                        # Debug: Show structure of first lease
+                        if page == 1 and page_leases:
+                            first_lease = page_leases[0]
+                            logger.info(f"   📋 First lease structure:")
+                            logger.info(f"      Available fields: {list(first_lease.keys())}")
+                            
+                            # Show property information
+                            property_info = None
+                            if 'property' in first_lease and isinstance(first_lease['property'], dict):
+                                property_info = first_lease['property']
+                                logger.info(f"      Property object: {property_info}")
+                            elif 'propertyId' in first_lease:
+                                logger.info(f"      PropertyId field: {first_lease['propertyId']}")
+                            elif 'property_id' in first_lease:
+                                logger.info(f"      Property_id field: {first_lease['property_id']}")
+                            else:
+                                logger.warning(f"      ⚠️ No obvious property identifier found")
+                            
+                            # Show date fields
+                            logger.info(f"   📅 Date fields in first lease:")
+                            for field in ['leaseStartDate', 'leaseEndDate', 'startDate', 'endDate', 'createdAt', 'updatedAt']:
+                                if field in first_lease:
+                                    logger.info(f"      {field}: {first_lease[field]}")
+                            
+                            # Show unit fields
+                            logger.info(f"   🏠 Unit fields in first lease:")
+                            for field in ['units', 'unit_id', 'unitId', 'unit', 'propertyUnitId']:
+                                if field in first_lease:
+                                    logger.info(f"      {field}: {first_lease[field]}")
+                        
+                        strategy_leases.extend(page_leases)
+                        logger.info(f"   ✅ Strategy {strategy_name} - Page {page}: {len(page_leases)} leases (total: {len(strategy_leases)})")
+                        
+                        # Check if this is the last page
+                        if len(page_leases) < 50:
+                            logger.info(f"   📄 Last page reached (got {len(page_leases)} < 50)")
+                            break
+                        
+                        page += 1
+                        
+                    except Exception as e:
+                        logger.error(f"   ❌ Error in strategy {strategy_name} on page {page}: {str(e)}")
+                        break
+                
+                logger.info(f"🎯 Strategy {strategy_name} result: {len(strategy_leases)} total leases")
+                
+                if len(strategy_leases) > 0:
+                    leases_data = strategy_leases
+                    successful_strategy = strategy_name
+                    logger.info(f"✅ Using strategy: {strategy_name}")
+                    break
+                else:
+                    logger.warning(f"❌ Strategy {strategy_name} returned 0 leases")
+            
+            if not leases_data:
+                logger.error(f"❌ All API strategies failed - no leases retrieved for property {property_id}")
+                logger.error("🔍 This could mean:")
+                logger.error("   1. No leases exist for this property")
+                logger.error("   2. Property ID is incorrect")
+                logger.error("   3. API filtering parameters don't work")
+                logger.error("   4. Authentication/permission issues")
+                return 0
+            
+            # Filter leases manually (important for date filtering and property verification)
+            logger.info(f"🔍 Applying manual filtering to {len(leases_data)} leases for property {property_id}")
+            logger.info(f"   📅 Target date range: {date_from} to {date_to}")
+            
+            occupied_unit_ids = set()
+            property_matches = 0
+            date_matches = 0
+            unit_extraction_successes = 0
+            
+            for i, lease in enumerate(leases_data):
+                # Debug first 5 leases in detail
+                if i < 5:
+                    logger.info(f"🔍 Detailed analysis of lease {i+1}:")
+                    logger.info(f"   Lease keys: {list(lease.keys())}")
+                
+                # Verify this lease is actually for the requested property
+                lease_property_id = None
+                
+                # Try different ways to get property ID from lease
+                if 'property' in lease and isinstance(lease['property'], dict):
+                    lease_property_id = lease['property'].get('id')
+                    if i < 5:
+                        logger.info(f"   Property from 'property' object: {lease_property_id}")
+                elif 'propertyId' in lease:
+                    lease_property_id = lease['propertyId']
+                    if i < 5:
+                        logger.info(f"   Property from 'propertyId': {lease_property_id}")
+                elif 'property_id' in lease:
+                    lease_property_id = lease['property_id']
+                    if i < 5:
+                        logger.info(f"   Property from 'property_id': {lease_property_id}")
+                
+                if i < 5:
+                    logger.info(f"   Extracted property ID: {lease_property_id}")
+                    logger.info(f"   Target property ID: {property_id}")
+                    logger.info(f"   Property match: {str(lease_property_id) == str(property_id)}")
+                
+                # Check property match
+                property_match = lease_property_id and str(lease_property_id) == str(property_id)
+                if property_match:
+                    property_matches += 1
+                    
+                    # Check if lease overlaps with the date range
+                    date_overlap = lease_overlaps_date_range(lease, date_from, date_to)
+                    if i < 5:
+                        logger.info(f"   Date overlap result: {date_overlap}")
+                    
+                    if date_overlap:
+                        date_matches += 1
+                        
+                        # Extract unit IDs
+                        unit_ids = []
+                        
+                        # Method 1: Check if 'units' field contains an array
+                        if "units" in lease and isinstance(lease["units"], list):
+                            unit_ids.extend(lease["units"])
+                            if i < 5:
+                                logger.info(f"   Units from 'units' array: {lease['units']}")
+                        
+                        # Method 2: Check for single unit ID fields
+                        for field_name in ["unit_id", "unitId", "propertyUnitId", "unit", "unitIds"]:
+                            if field_name in lease and lease[field_name]:
+                                if isinstance(lease[field_name], list):
+                                    unit_ids.extend(lease[field_name])
+                                else:
+                                    unit_ids.append(lease[field_name])
+                                if i < 5:
+                                    logger.info(f"   Units from '{field_name}': {lease[field_name]}")
+                        
+                        if i < 5:
+                            logger.info(f"   Total unit IDs extracted: {unit_ids}")
+                        
+                        # Add all found unit IDs to the set
+                        units_added = 0
+                        for unit_id in unit_ids:
+                            if unit_id:
+                                occupied_unit_ids.add(str(unit_id))
+                                units_added += 1
+                        
+                        if units_added > 0:
+                            unit_extraction_successes += 1
+                        
+                        if i < 5:
+                            logger.info(f"   Units added to set: {units_added}")
+                    else:
+                        if i < 5:
+                            logger.info(f"   ❌ Lease does not overlap with date range")
+                else:
+                    if i < 5:
+                        logger.info(f"   ❌ Lease property ID doesn't match target")
+            
+            occupied_count = len(occupied_unit_ids)
+            
+            logger.info(f"📊 Manual filtering summary for property {property_id}:")
+            logger.info(f"   Total leases processed: {len(leases_data)}")
+            logger.info(f"   Property matches: {property_matches}")
+            logger.info(f"   Date matches: {date_matches}")
+            logger.info(f"   Successful unit extractions: {unit_extraction_successes}")
+            logger.info(f"   Unique occupied units: {occupied_count}")
+            logger.info(f"   Strategy used: {successful_strategy}")
+            
+            if occupied_count == 0:
+                logger.warning(f"⚠️ Found 0 occupied units for property {property_id}. Possible issues:")
+                logger.warning(f"   - Property filter not working (got {property_matches} property matches)")
+                logger.warning(f"   - Date filter not working (got {date_matches} date matches)")
+                logger.warning(f"   - Unit ID extraction failed (got {unit_extraction_successes} extractions)")
+                logger.warning(f"   - All leases are outside the date range")
+                logger.warning(f"   - No active leases for this property")
+            
+            return occupied_count
+            
+        except Exception as e:
+            logger.error(f"❌ Error in get_occupied_units_property for property {property_id}: {str(e)}")
+            raise
+
 @router.get("/occupancy-rate-doorloop")
 async def get_occupancy_rate(
     date_from: Optional[str] = None,
-    date_to: Optional[str] = None
+    date_to: Optional[str] = None,
+    property_id: Optional[str] = None
 ):
     """
     Calculate occupancy rate: (occupied units / total units) * 100
@@ -554,6 +1019,7 @@ async def get_occupancy_rate(
     Parameters:
     - date_from: Start date (YYYY-MM-DD) - defaults to current month start
     - date_to: End date (YYYY-MM-DD) - defaults to current month end
+    - property_id: Optional property ID to calculate occupancy for specific property
     """
     
     if not DOORLOOP_API_KEY:
@@ -568,35 +1034,183 @@ async def get_occupancy_rate(
     
     headers = get_doorloop_headers()
     
-    logger.info(f"Calculating occupancy rate from {date_from} to {date_to}")
+    if property_id:
+        logger.info(f"Calculating occupancy rate for property {property_id} from {date_from} to {date_to}")
+        
+        try:
+            # Get total units for the specific property
+            total_units = await get_units_by_property(property_id)
+            logger.info(f"Property {property_id}: {total_units} total units")
+            
+            # Get occupied units for the specific property
+            occupied_units = await get_leases_by_property(property_id, date_from, date_to)
+            logger.info(f"Property {property_id}: {occupied_units} occupied units")
+            
+            # Calculate occupancy rate
+            if total_units == 0:
+                occupancy_rate = 0
+
+            else:
+                totalUnits = total_units["numOfUnits"]
+                unitsDict = occupied_units.get("units", {})
+
+                percentSum = 0
+                for key in unitsDict.keys():
+                    if len(unitsDict[key]) > 1:
+                        percentSum += sum(unitsDict[key]) / len(unitsDict[key])
+                    else:
+                        percentSum += unitsDict[key][0]
+
+                
+                occupancy_rate_percentage_for_property = percentSum / totalUnits
+
+            
+            return {
+                "occupied_units": len(unitsDict),
+                "total_units": totalUnits,
+                "property_id": property_id,
+                "date_from": date_from,
+                "date_to": date_to,
+                "percentage": f"{round(occupancy_rate_percentage_for_property, 2)}%"
+            }
+            
+        except Exception as e:
+            logger.error(f"Error calculating occupancy rate for property {property_id}: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error calculating occupancy rate for property {property_id}: {str(e)}")
     
-    try:
-        # Get total units from properties
-        total_units = await get_total_units(headers)
-        logger.info(f"Found {total_units} total units")
+    else:
+        logger.info(f"Calculating overall occupancy rate from {date_from} to {date_to}")
         
-        # Get occupied units from active leases
-        occupied_units = await get_occupied_units(headers, date_from, date_to)
-        logger.info(f"Found {occupied_units} occupied units")
-        
-        # Calculate occupancy rate
-        if total_units == 0:
-            occupancy_rate = 0
-        else:
-            occupancy_rate = (occupied_units / total_units) * 100
-        
-        return {
-            "occupancy_rate": round(occupancy_rate, 2),
-            "occupied_units": occupied_units,
-            "total_units": total_units,
-            "date_from": date_from,
-            "date_to": date_to,
-            "percentage": f"{round(occupancy_rate, 2)}%"
-        }
-        
-    except Exception as e:
-        logger.error(f"Error calculating occupancy rate: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error calculating occupancy rate: {str(e)}")
+        try:
+            # Get total units from all properties
+            total_units = await get_total_units(headers)
+            logger.info(f"Found {total_units} total units")
+            
+            # Get occupied units from active leases
+            occupied_units = await get_occupied_units(headers, date_from, date_to)
+            logger.info(f"Found {occupied_units} occupied units")
+            
+            # Calculate occupancy rate
+            if total_units == 0:
+                occupancy_rate = 0
+            else:
+                occupancy_rate = (occupied_units / total_units) * 100
+            
+            return {
+                "occupancy_rate": round(occupancy_rate, 2),
+                "occupied_units": occupied_units,
+                "total_units": total_units,
+                "date_from": date_from,
+                "date_to": date_to,
+                "percentage": f"{round(occupancy_rate, 2)}%"
+            }
+            
+        except Exception as e:
+            logger.error(f"Error calculating overall occupancy rate: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error calculating overall occupancy rate: {str(e)}")
+
+
+    # if property_id:
+    #     logger.info(f"Calculating occupancy rate for property {property_id} from {date_from} to {date_to}")
+    #     try:
+    #         # Get total units for the specific property
+    #         total_units_response = await get_units_by_property(property_id)
+            
+    #         # DEBUG: Log the actual response structure
+    #         logger.info(f"DEBUG - total_units_response type: {type(total_units_response)}")
+    #         logger.info(f"DEBUG - total_units_response content: {total_units_response}")
+            
+    #         # Handle different response types
+    #         if isinstance(total_units_response, str):
+    #             logger.error(f"ERROR: get_units_by_property returned a string instead of dict: {total_units_response}")
+    #             raise HTTPException(status_code=500, detail="Invalid response format from units API")
+            
+    #         if not isinstance(total_units_response, dict):
+    #             logger.error(f"ERROR: get_units_by_property returned unexpected type: {type(total_units_response)}")
+    #             raise HTTPException(status_code=500, detail="Invalid response format from units API")
+            
+    #         # Extract total units count
+    #         total_units = total_units_response.get("numOfUnits", 0)
+    #         logger.info(f"Property {property_id}: {total_units} total units")
+            
+    #         # Get occupied units for the specific property
+    #         occupied_units_response = await get_leases_by_property(property_id, date_from, date_to)
+            
+    #         # DEBUG: Log the lease response structure
+    #         logger.info(f"DEBUG - occupied_units_response type: {type(occupied_units_response)}")
+    #         logger.info(f"DEBUG - occupied_units_response content: {occupied_units_response}")
+            
+    #         # Handle different response types
+    #         if isinstance(occupied_units_response, str):
+    #             logger.error(f"ERROR: get_leases_by_property returned a string instead of dict: {occupied_units_response}")
+    #             raise HTTPException(status_code=500, detail="Invalid response format from leases API")
+            
+    #         if not isinstance(occupied_units_response, dict):
+    #             logger.error(f"ERROR: get_leases_by_property returned unexpected type: {type(occupied_units_response)}")
+    #             raise HTTPException(status_code=500, detail="Invalid response format from leases API")
+            
+    #         # Extract units dictionary
+    #         units_dict = occupied_units_response.get("units", {})
+    #         logger.info(f"DEBUG - units_dict type: {type(units_dict)}")
+    #         logger.info(f"DEBUG - units_dict content: {units_dict}")
+            
+    #         # Calculate occupancy rate
+    #         if total_units == 0:
+    #             occupancy_rate_percentage = 0.0
+    #             logger.warning(f"Property {property_id} has 0 total units")
+    #         else:
+    #             if not units_dict:
+    #                 occupancy_rate_percentage = 0.0
+    #                 logger.info(f"Property {property_id} has no occupied units")
+    #             else:
+    #                 # Calculate occupancy percentage
+    #                 percent_sum = 0.0
+    #                 for unit_id, occupancy_data in units_dict.items():
+    #                     logger.info(f"DEBUG - Processing unit {unit_id}: {occupancy_data}")
+                        
+    #                     if isinstance(occupancy_data, list):
+    #                         if len(occupancy_data) > 1:
+    #                             unit_percentage = sum(occupancy_data) / len(occupancy_data)
+    #                         elif len(occupancy_data) == 1:
+    #                             unit_percentage = occupancy_data[0]
+    #                         else:
+    #                             unit_percentage = 0.0
+    #                     else:
+    #                         # Handle case where occupancy_data is not a list
+    #                         unit_percentage = float(occupancy_data) if occupancy_data else 0.0
+                        
+    #                     percent_sum += unit_percentage
+    #                     logger.info(f"DEBUG - Unit {unit_id} percentage: {unit_percentage}")
+                    
+    #                 occupancy_rate_percentage = percent_sum / total_units
+    #                 logger.info(f"DEBUG - Final calculation: {percent_sum} / {total_units} = {occupancy_rate_percentage}")
+            
+    #         return {
+    #             "occupied_units": len(units_dict),
+    #             "total_units": total_units,
+    #             "property_id": property_id,
+    #             "date_from": date_from,
+    #             "date_to": date_to,
+    #             "percentage": f"{round(occupancy_rate_percentage * 100, 2)}%",
+    #             "debug_info": {
+    #                 "total_units_response_type": str(type(total_units_response)),
+    #                 "occupied_units_response_type": str(type(occupied_units_response)),
+    #                 "units_dict_keys": list(units_dict.keys()) if isinstance(units_dict, dict) else "Not a dict"
+    #             }
+    #         }
+            
+    #     except Exception as e:
+    #         logger.error(f"Error calculating occupancy rate for property {property_id}: {str(e)}")
+    #         logger.error(f"Error type: {type(e)}")
+    #         import traceback
+    #         logger.error(f"Full traceback: {traceback.format_exc()}")
+    #         raise HTTPException(
+    #             status_code=500, 
+    #             detail=f"Error calculating occupancy rate for property {property_id}: {str(e)}"
+    #         )
+
+
+
 
 async def get_total_units(headers):
     """Get total number of units from all properties"""
@@ -1047,250 +1661,157 @@ async def debug_occupancy_rate():
     }
 
 @router.get("/units")
-async def get_units(
-    property_id: str = None,
-    status: str = None,
-    unit_type: str = None,
-    page: int = 1,
-    fetch_all: bool = False
-):
-    """Get units from Doorloop API with optional filtering.
-    
-    Args:
-        property_id: Filter by specific property ID
-        status: Filter by unit status (e.g., 'available', 'occupied', 'maintenance')
-        unit_type: Filter by unit type
-        page: Page number (default: 1) - Note: Doorloop controls page size
-        fetch_all: If True, fetches all pages and returns combined results
-    """
+async def get_units_by_property(property_id: str):
+    """Get all units for a specific property from Doorloop API."""
     units_url = f"{DOORLOOP_BASE_URL}/units"
     headers = get_doorloop_headers()
     
-    # Build query parameters (Doorloop controls pagination)
-    params = {}
+    logger.info(f"Making request to: {units_url}")
     
-    # Add page parameter (let Doorloop control page size)
-    if not fetch_all:
-        params["page"] = page
-    
-    # Add optional filters
-    if property_id:
-        params["property_id"] = property_id
-    if status:
-        params["status"] = status
-    if unit_type:
-        params["unit_type"] = unit_type
-    
-    logger.info(f"Making request to: {units_url} with params: {params}")
-    
-    if fetch_all:
-        # Fetch all pages
-        all_units = []
-        current_page = 1
-        total_count = 0
-        
-        async with httpx.AsyncClient() as client:
-            while True:
-                page_params = {**params, "page": current_page}
-                
-                try:
-                    logger.info(f"Fetching page {current_page}")
-                    resp = await client.get(units_url, headers=headers, params=page_params)
-                    resp.raise_for_status()
-                    
-                    if not resp.content:
-                        break
-                    
-                    data = resp.json()
-                    page_units = data.get('data', [])
-                    
-                    if not page_units:
-                        break
-                    
-                    all_units.extend(page_units)
-                    total_count = data.get('total', len(all_units))
-                    
-                    logger.info(f"Page {current_page}: {len(page_units)} units (total so far: {len(all_units)})")
-                    
-                    # Check if this is the last page
-                    if len(page_units) < 50:  # Doorloop's apparent page size
-                        break
-                    
-                    current_page += 1
-                    
-                except Exception as e:
-                    logger.error(f"Error fetching page {current_page}: {e}")
-                    break
-        
-        return {
-            "success": True,
-            "data": all_units,
-            "pagination": {
-                "fetch_all": True,
-                "total_pages_fetched": current_page,
-                "total_units": len(all_units),
-                "doorloop_reported_total": total_count
-            },
-            "filters_applied": {
-                "property_id": property_id,
-                "status": status,
-                "unit_type": unit_type
-            },
-            "summary": {
-                "total_units_fetched": len(all_units)
+    params = {
+        "filter_property": property_id
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(units_url, headers=headers, params=params)
+            resp.raise_for_status()
+            
+            logger.info(f"Successfully fetched units for property {property_id}")
+            
+            data = resp.json()
+            
+            # Get the actual units array from the response
+            units = data.get('data', [])
+            
+            # Count unique units
+            numOfUnits = set()
+            for unit in units:
+                if 'id' in unit:
+                    numOfUnits.add(unit["id"])
+
+            # Log the results
+            logger.info(f"Unique unit IDs found: {numOfUnits}")
+            logger.info(f"Total unique units for property {property_id}: {len(numOfUnits)}")
+            
+            return {
+                "success": True,
+                "numOfUnits": len(numOfUnits),
+                "property_id": params["filter_property"],
+                "units": list(numOfUnits),
+                "total_units_returned": len(units),
+                "raw_response_structure": list(data.keys()) if isinstance(data, dict) else "not_dict"
             }
-        }
+
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP Error {e.response.status_code} for property {property_id}: {e.response.text}")
+            return {
+                "success": False,
+                "status": e.response.status_code,
+                "message": f"HTTP Error {e.response.status_code}",
+                "error_details": e.response.text,
+                "property_id": params["filter_property"]
+            }
+        
+
+@router.get("/leases")
+async def get_leases_by_property(
+    property_id: str,
+    start_date: str = None,
+    end_date: str = None
+):
+    """Get all leases for a specific property from Doorloop API with optional date filtering.
     
-    else:
-        # Single page request
-        async with httpx.AsyncClient() as client:
-            try:
-                resp = await client.get(units_url, headers=headers, params=params)
-                
-                # Log response details for debugging
-                logger.info(f"Units API response status: {resp.status_code}")
-                logger.info(f"Units API response headers: {dict(resp.headers)}")
-                
-                resp.raise_for_status()
-                
-                # Check if response has content
-                if not resp.content:
-                    logger.warning("Empty response from Doorloop units API")
-                    return {
-                        "success": True,
-                        "message": "No units data available", 
-                        "data": [],
-                        "pagination": {
-                            "page": page,
-                            "units_on_page": 0,
-                            "total": 0,
-                            "note": "Doorloop controls pagination - actual page size may vary"
-                        },
-                        "filters_applied": {
-                            "property_id": property_id,
-                            "status": status,
-                            "unit_type": unit_type
-                        }
-                    }
-                
-                # Check content type
-                content_type = resp.headers.get("content-type", "")
-                logger.info(f"Response content type: {content_type}")
-                
-                # Check if we got HTML (login page) instead of JSON
-                if "text/html" in content_type:
-                    logger.warning("Received HTML response (likely login page)")
-                    return {
-                        "success": False,
-                        "message": "Received HTML response (likely login page)",
-                        "content_type": content_type,
-                        "suggestion": "This endpoint may not exist or requires different authentication"
-                    }
-                
-                # Try to parse JSON
-                try:
-                    data = resp.json()
-                    units = data.get('data', [])
-                    total_count = data.get('total', 0)
+    Args:
+        property_id: The property ID to filter leases by
+        date_from: Start date (YYYY-MM-DD) - optional
+        date_to: End date (YYYY-MM-DD) - optional
+    """
+    leases_url = f"{DOORLOOP_BASE_URL}/leases"
+    headers = get_doorloop_headers()
+    
+    # Build base parameters
+    params = {
+        "filter_property": property_id
+    }
+
+    start_date = datetime.strptime(start_date, "%Y-%m-%d")
+    end_date = datetime.strptime(end_date, "%Y-%m-%d")
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(leases_url, headers=headers, params=params)
+            resp.raise_for_status()
+            
+            data = resp.json()
+
+            units = defaultdict(list)
+            
+            for lease in data["data"]:
+                lease_start_date = datetime.strptime(lease["start"], "%Y-%m-%d")
+                lease_end_date = datetime.strptime(lease["end"], "%Y-%m-%d")
+
+                if lease["id"] not in units:
                     
-                    # Doorloop's actual page size (discovered from response)
-                    actual_page_size = len(units)
+                    if lease_end_date < start_date:
+                        continue
+
+                    elif start_date < lease_start_date or lease_end_date < end_date:
+                        total_days = end_date - start_date
+                        remaining_days = (end_date - lease_end_date) + (lease_start_date - start_date)
+                        days_occupied = total_days - remaining_days
+                        occupied_percentage = (days_occupied / total_days) * 100
+                        
+                        units[lease["id"]].append(occupied_percentage) 
+
                     
-                    logger.info(f"Successfully fetched {len(units)} units from Doorloop (page {page})")
-                    logger.info(f"Doorloop's actual page size: {actual_page_size}")
-                    logger.info(f"Doorloop reported total: {total_count}")
-                    
-                    # Calculate pagination info based on Doorloop's actual behavior
-                    estimated_page_size = 50  # Doorloop's apparent default
-                    if total_count > 0:
-                        estimated_total_pages = (total_count + estimated_page_size - 1) // estimated_page_size
-                        has_next = page < estimated_total_pages
-                        has_prev = page > 1
-                    else:
-                        estimated_total_pages = 1
-                        has_next = actual_page_size >= estimated_page_size  # Might have more if page is full
-                        has_prev = page > 1
-                    
-                    return {
-                        "success": True,
-                        "data": units,
-                        "pagination": {
-                            "page": page,
-                            "units_on_page": actual_page_size,
-                            "total": total_count,
-                            "estimated_total_pages": estimated_total_pages,
-                            "has_next": has_next,
-                            "has_prev": has_prev,
-                            "next_page": page + 1 if has_next else None,
-                            "prev_page": page - 1 if has_prev else None,
-                            "doorloop_page_size": actual_page_size,
-                            "note": "Doorloop controls pagination - page size is determined by Doorloop API"
-                        },
-                        "filters_applied": {
-                            "property_id": property_id,
-                            "status": status,
-                            "unit_type": unit_type
-                        },
-                        "summary": {
-                            "units_on_page": actual_page_size,
-                            "total_units": total_count
-                        }
-                    }
-                    
-                except ValueError as json_error:
-                    logger.error(f"Failed to parse JSON response: {json_error}")
-                    logger.error(f"Response content preview: {resp.text[:500]}")
-                    return {
-                        "success": False,
-                        "message": "Units data received but not in JSON format",
-                        "content_type": content_type,
-                        "raw_response": resp.text[:1000]
-                    }
-                    
-            except httpx.HTTPStatusError as e:
-                logger.error(f"HTTP Error {e.response.status_code} for units: {e.response.text}")
+                    elif lease_start_date <= start_date and end_date <= lease_end_date:
+                        units[lease["id"]].append(100)
                 
-                if e.response.status_code == 400:
-                    try:
-                        error_data = e.response.json()
-                        return {
-                            "success": False,
-                            "status": 400,
-                            "message": "Bad Request - Invalid parameters",
-                            "error_details": error_data,
-                            "parameters_sent": params,
-                            "suggestion": "Check if the filter parameters are valid"
-                        }
-                    except:
-                        return {
-                            "success": False,
-                            "status": 400,
-                            "message": "Bad Request",
-                            "error_text": e.response.text,
-                            "parameters_sent": params
-                        }
-                elif e.response.status_code == 404:
-                    return {
-                        "success": False,
-                        "status": 404,
-                        "message": "Units endpoint not found",
-                        "suggestion": "The /units endpoint may not be available in your Doorloop plan"
-                    }
+               
+
+            logger.info(units)
+            return {
+                "success": True,
+                "units": units
+            }
+
+
+
+            percentSum = 0
+            total_units = len(units)
+            for unit in units:
+                if len(units[unit]) > 1:
+                    percentSum += sum(units[unit]) / len(units[unit])
                 else:
-                    return {
-                        "success": False,
-                        "status": e.response.status_code,
-                        "message": f"HTTP Error {e.response.status_code}",
-                        "error_details": e.response.text
-                    }
+                    percentSum += units[unit][0]
+
+            
+            occupancy_rate_percentage_for_property = percentSum / total_units
+
+            return occupancy_rate_percentage_for_property
                     
-            except Exception as e:
-                logger.error(f"Unexpected error fetching units: {e}")
-                return {
-                    "success": False,
-                    "message": f"Unexpected error: {str(e)}",
-                    "error_type": type(e).__name__
-                }
+
+
+            
+
+
+
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP Error {e.response.status_code} for property {property_id}: {e.response.text}")
+            return {
+                "success": False,
+                "status": e.response.status_code,
+                "message": f"HTTP Error {e.response.status_code}",
+                "error_details": e.response.text,
+                "property_id": property_id,
+                "date_range": {
+                    "date_from": start_date,
+                    "date_to": end_date
+                } if start_date and end_date else None
+            }
+
+
 
 @router.get("/units/{unit_id}")
 async def get_unit_by_id(unit_id: str):
@@ -1374,4 +1895,7 @@ async def get_unit_by_id(unit_id: str):
                 "message": f"Unexpected error: {str(e)}",
                 "unit_id": clean_unit_id
             }
+        
+
+
 
