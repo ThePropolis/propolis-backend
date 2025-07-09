@@ -1667,7 +1667,7 @@ async def debug_occupancy_rate():
         ]
     }
 
-@router.get("/units")
+
 async def get_units_by_property(property_id: str):
     """Get all units for a specific property from Doorloop API."""
     units_url = f"{DOORLOOP_BASE_URL}/units"
