@@ -1064,15 +1064,22 @@ async def get_occupancy_rate(
                 
                 occupancy_rate_percentage_for_property = percentSum / totalUnits
 
-            
             return {
+                "occupancy_rate": round(occupancy_rate_percentage_for_property, 2),
                 "occupied_units": len(unitsDict),
                 "total_units": totalUnits,
-                "property_id": property_id,
                 "date_from": date_from,
                 "date_to": date_to,
                 "percentage": f"{round(occupancy_rate_percentage_for_property, 2)}%"
             }
+            # return {
+            #     "occupied_units": len(unitsDict),
+            #     "total_units": totalUnits,
+            #     "property_id": property_id,
+            #     "date_from": date_from,
+            #     "date_to": date_to,
+            #     "percentage": f"{round(occupancy_rate_percentage_for_property, 2)}%"
+            # }
             
         except Exception as e:
             logger.error(f"Error calculating occupancy rate for property {property_id}: {str(e)}")
@@ -1727,89 +1734,164 @@ async def get_leases_by_property(
         date_from: Start date (YYYY-MM-DD) - optional
         date_to: End date (YYYY-MM-DD) - optional
     """
-    leases_url = f"{DOORLOOP_BASE_URL}/leases"
-    headers = get_doorloop_headers()
+    # leases_url = f"{DOORLOOP_BASE_URL}/leases"
+    # headers = get_doorloop_headers()
     
-    # Build base parameters
-    params = {
-        "filter_property": property_id
-    }
+    # # Build base parameters
+    # params = {
+    #     "filter_property": property_id
+    # }
 
-    start_date = datetime.strptime(start_date, "%Y-%m-%d")
-    end_date = datetime.strptime(end_date, "%Y-%m-%d")
+    # start_date = datetime.strptime(start_date, "%Y-%m-%d")
+    # end_date = datetime.strptime(end_date, "%Y-%m-%d")
     
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.get(leases_url, headers=headers, params=params)
-            resp.raise_for_status()
+    # async with httpx.AsyncClient() as client:
+    #     try:
+    #         resp = await client.get(leases_url, headers=headers, params=params)
+    #         resp.raise_for_status()
             
-            data = resp.json()
+    #         data = resp.json()
 
-            units = defaultdict(list)
+    #         units = defaultdict(list)
             
-            for lease in data["data"]:
-                lease_start_date = datetime.strptime(lease["start"], "%Y-%m-%d")
-                lease_end_date = datetime.strptime(lease["end"], "%Y-%m-%d")
+    #         for lease in data["data"]:
+    #             lease_start_date = datetime.strptime(lease["start"], "%Y-%m-%d")
+    #             lease_end_date = datetime.strptime(lease["end"], "%Y-%m-%d")
 
-                if lease["id"] not in units:
+    #             if lease["id"] not in units:
                     
-                    if lease_end_date < start_date:
-                        continue
+    #                 if lease_end_date < start_date:
+    #                     continue
 
-                    elif start_date < lease_start_date or lease_end_date < end_date:
-                        total_days = end_date - start_date
-                        remaining_days = (end_date - lease_end_date) + (lease_start_date - start_date)
-                        days_occupied = total_days - remaining_days
-                        occupied_percentage = (days_occupied / total_days) * 100
+    #                 elif start_date < lease_start_date or lease_end_date < end_date:
+    #                     total_days = end_date - start_date
+    #                     remaining_days = (end_date - lease_end_date) + (lease_start_date - start_date)
+    #                     days_occupied = total_days - remaining_days
+    #                     occupied_percentage = (days_occupied / total_days) * 100
                         
-                        units[lease["id"]].append(occupied_percentage) 
+    #                     units[lease["id"]].append(occupied_percentage) 
 
                     
-                    elif lease_start_date <= start_date and end_date <= lease_end_date:
-                        units[lease["id"]].append(100)
+    #                 elif lease_start_date <= start_date and end_date <= lease_end_date:
+    #                     units[lease["id"]].append(100)
                 
                
 
+    #         logger.info(units)
+    #         return {
+    #             "success": True,
+    #             "units": units
+    #         }
+
+
+
+            # percentSum = 0
+            # total_units = len(units)
+            # for unit in units:
+            #     if len(units[unit]) > 1:
+            #         percentSum += sum(units[unit]) / len(units[unit])
+            #     else:
+            #         percentSum += units[unit][0]
+
+            
+            # occupancy_rate_percentage_for_property = percentSum / total_units
+
+            # return occupancy_rate_percentage_for_property
+                    
+
+    try:
+        leases_url = f"{DOORLOOP_BASE_URL}/leases"
+        headers = get_doorloop_headers()
+        
+        # Build base parameters
+        params = {
+            "filter_property": property_id
+        }
+        
+        # Parse dates only if provided
+        parsed_start_date = None
+        parsed_end_date = None
+        
+        if start_date:
+            try:
+                parsed_start_date = datetime.strptime(start_date, "%Y-%m-%d")
+            except ValueError:
+                return {"success": False, "error": "Invalid start_date format. Use YYYY-MM-DD"}
+        
+        if end_date:
+            try:
+                parsed_end_date = datetime.strptime(end_date, "%Y-%m-%d")
+            except ValueError:
+                return {"success": False, "error": "Invalid end_date format. Use YYYY-MM-DD"}
+        
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(leases_url, headers=headers, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            
+            units = defaultdict(list)
+            
+            for lease in data["data"]:
+                try:
+                    lease_start_date = datetime.strptime(lease["start"], "%Y-%m-%d")
+                    lease_end_date = datetime.strptime(lease["end"], "%Y-%m-%d")
+                    
+                    # If no date filtering, just add 100%
+                    if not parsed_start_date or not parsed_end_date:
+                        units[lease["id"]].append(100)
+                        continue
+                    
+                    # Skip leases that end before our start date
+                    if lease_end_date < parsed_start_date:
+                        continue
+                    
+                    # Skip leases that start after our end date
+                    if lease_start_date > parsed_end_date:
+                        continue
+                    
+                    # Calculate overlap between lease period and requested period
+                    overlap_start = max(lease_start_date, parsed_start_date)
+                    overlap_end = min(lease_end_date, parsed_end_date)
+                    
+                    if overlap_start <= overlap_end:
+                        total_days = (parsed_end_date - parsed_start_date).days
+                        occupied_days = (overlap_end - overlap_start).days + 1  # +1 to include both dates
+                        
+                        if total_days > 0:
+                            occupied_percentage = (occupied_days / total_days) * 100
+                            units[lease["id"]].append(min(100, occupied_percentage))  # Cap at 100%
+                
+                except (KeyError, ValueError) as e:
+                    logger.error(f"Error processing lease {lease.get('id', 'unknown')}: {e}")
+                    continue
+            
             logger.info(units)
             return {
                 "success": True,
                 "units": units
             }
-
-
-
-            percentSum = 0
-            total_units = len(units)
-            for unit in units:
-                if len(units[unit]) > 1:
-                    percentSum += sum(units[unit]) / len(units[unit])
-                else:
-                    percentSum += units[unit][0]
-
             
-            occupancy_rate_percentage_for_property = percentSum / total_units
-
-            return occupancy_rate_percentage_for_property
-                    
-
-
+    except httpx.HTTPError as e:
+        logger.error(f"HTTP error: {e}")
+        return {"success": False, "error": f"HTTP error: {str(e)}"}
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        return {"success": False, "error": f"Internal server error: {str(e)}"}
             
 
-
-
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP Error {e.response.status_code} for property {property_id}: {e.response.text}")
-            return {
-                "success": False,
-                "status": e.response.status_code,
-                "message": f"HTTP Error {e.response.status_code}",
-                "error_details": e.response.text,
-                "property_id": property_id,
-                "date_range": {
-                    "date_from": start_date,
-                    "date_to": end_date
-                } if start_date and end_date else None
-            }
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP Error {e.response.status_code} for property {property_id}: {e.response.text}")
+        return {
+            "success": False,
+            "status": e.response.status_code,
+            "message": f"HTTP Error {e.response.status_code}",
+            "error_details": e.response.text,
+            "property_id": property_id,
+            "date_range": {
+                "date_from": start_date,
+                "date_to": end_date
+            } if start_date and end_date else None
+        }
 
 
 
