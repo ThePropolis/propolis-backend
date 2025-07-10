@@ -452,7 +452,7 @@ async def get_doorloop_profit_and_loss(
     end_date: str = None,
     property_id: str = None,
     unit_id: str = None,
-    accounting_method: str = "CASH"
+    accounting_method: str = "ACCRUAL"
 ):
     """Get profit and loss summary from Doorloop API.
     
