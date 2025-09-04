@@ -233,3 +233,175 @@ def get_reservations() -> List[Dict]:
             listing["pictures"] = [listing["thumbnail_url"]] if listing.get("thumbnail_url") else []
 
     return listings_res.data or []
+
+@router.get("/db/units-for-property")
+async def get_units_for_property(
+    property: str = Query(..., description="Property name (required)")
+):
+    """Get all units for a specific property from Supabase"""
+    try:
+        # Parse property name to remove "Apartments" suffix
+        parsed_property = property.replace(" Apartments", "").replace("Apartments", "")
+        print(f"🔍 Original property: {property}")
+        print(f"🔍 Parsed property: {parsed_property}")
+        
+        # Build the query step by step
+        query = supabase.table("STR-Jul-2025").select("Unit")
+        query = query.eq("Property", parsed_property)
+        
+        print(f"🔍 Executing query...")
+        response = query.execute()
+        
+        print(f"🔍 Response received: {len(response.data) if response.data else 0} units found")
+        
+        return {
+            "data": response.data or [],
+            "count": len(response.data) if response.data else 0,
+            "property": property,
+            "parsed_property": parsed_property
+        }
+    except Exception as e:
+        print(f"❌ Error in get_units_for_property: {str(e)}")
+        print(f"❌ Error type: {type(e)}")
+        import traceback
+        print(f"❌ Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@router.get("/db/unit-filtering")
+async def get_unit_filtering_data(
+    property: str = Query(..., description="Property name (required)"),
+    unit: str = Query(..., description="Unit name (required)")
+):
+    """Get unit filtering data from Supabase with mandatory property and unit filters"""
+    try:
+        # Parse property name to remove "Apartments" suffix
+        parsed_property = property.replace(" Apartments", "").replace("Apartments", "")
+        print(f"🔍 Original property: {property}")
+        print(f"🔍 Parsed property: {parsed_property}")
+        print(f"🔍 Unit: {unit}")
+        
+        response = supabase.table("STR-Jul-2025").select("Property, Unit, Revenue").eq("Property", parsed_property).eq("Unit", unit).execute()
+        
+        print(f"🔍 Response received: {len(response.data) if response.data else 0} records found")
+        
+        return {
+            "data": response.data,
+            "count": len(response.data),
+            "filters_applied": {
+                "property": property,
+                "parsed_property": parsed_property,
+                "unit": unit
+            }
+        }
+    except Exception as e:
+        print(f"❌ Error in get_unit_filtering_data: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@router.get("/db/rent-paid-units")
+async def get_rent_paid_units(
+    property: str = Query(..., description="Property name (required)")
+):
+    """Get all units and their total paid amounts for a specific property from Rent-Paid-July-2025 table"""
+    try:
+        # Parse property name to remove "Apartments" suffix
+        parsed_property = property.replace(" Apartments", "").replace("Apartments", "")
+        print(f"🔍 Original property: {property}")
+        print(f"🔍 Parsed property: {parsed_property}")
+        
+        # Query the Rent-Paid-July-2025 table
+        response = supabase.table("Rent-Paid-July-2025").select("Property, Unit, Total_Paid").eq("Property", parsed_property).execute()
+        
+        print(f"🔍 Response received: {len(response.data) if response.data else 0} units found")
+        
+        # Calculate total paid for the property
+        total_property_paid = sum(float(record.get("Total_Paid", 0)) for record in (response.data or []))
+        
+        # Debug: Output the units and their data
+        print(f"📋 Units found for property '{parsed_property}':")
+        for i, record in enumerate(response.data or [], 1):
+            unit = record.get("Unit", "N/A")
+            total_paid = record.get("Total_Paid", 0)
+            print(f"  {i}. Unit: {unit}, Total Paid: ${total_paid}")
+        
+        print(f"💰 Total property paid: ${round(total_property_paid, 2)}")
+        
+        return {
+            "data": response.data or [],
+            "count": len(response.data) if response.data else 0,
+            "property": property,
+            "parsed_property": parsed_property,
+            "total_property_paid": round(total_property_paid, 2),
+            "units": [record.get("Unit") for record in (response.data or []) if record.get("Unit")]
+        }
+    except Exception as e:
+        print(f"❌ Error in get_rent_paid_units: {str(e)}")
+        print(f"❌ Error type: {type(e)}")
+        import traceback
+        print(f"❌ Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@router.get("/db/rent-paid-unit-details")
+async def get_rent_paid_unit_details(
+    property: str = Query(..., description="Property name (required)"),
+    unit: str = Query(..., description="Unit name (required)")
+):
+    """Get specific unit's total paid amount from Rent-Paid-July-2025 table"""
+    try:
+        # Parse property name to remove "Apartments" suffix
+        parsed_property = property.replace(" Apartments", "").replace("Apartments", "")
+        print(f"🔍 Original property: {property}")
+        print(f"🔍 Parsed property: {parsed_property}")
+        print(f"🔍 Unit: {unit}")
+        
+        response = supabase.table("Rent-Paid-July-2025").select("Property, Unit, Total_Paid").eq("Property", parsed_property).eq("Unit", unit).execute()
+        
+        print(f"🔍 Response received: {len(response.data) if response.data else 0} records found")
+        
+        # Get the total paid amount for this specific unit
+        unit_total_paid = 0
+        if response.data:
+            unit_total_paid = float(response.data[0].get("Total_Paid", 0))
+            print(f"📋 Unit details for '{unit}' in property '{parsed_property}':")
+            print(f"  Unit: {unit}")
+            print(f"  Total Paid: ${unit_total_paid}")
+        else:
+            print(f"❌ No data found for unit '{unit}' in property '{parsed_property}'")
+        
+        return {
+            "data": response.data,
+            "count": len(response.data),
+            "unit_total_paid": round(unit_total_paid, 2),
+            "filters_applied": {
+                "property": property,
+                "parsed_property": parsed_property,
+                "unit": unit
+            }
+        }
+    except Exception as e:
+        print(f"❌ Error in get_rent_paid_unit_details: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@router.get("/db/rent-paid-properties")
+async def get_rent_paid_properties():
+    """Get all unique properties from Rent-Paid-July-2025 table"""
+    try:
+        # Get all unique properties
+        response = supabase.table("Rent-Paid-July-2025").select("Property").execute()
+        
+        # Extract unique property names
+        unique_properties = list(set(record.get("Property") for record in (response.data or []) if record.get("Property")))
+        unique_properties.sort()  # Sort alphabetically
+        
+        print(f"🔍 Found {len(unique_properties)} unique properties")
+        print(f"📋 Available properties:")
+        for i, prop in enumerate(unique_properties, 1):
+            print(f"  {i}. {prop}")
+        
+        return {
+            "properties": unique_properties,
+            "count": len(unique_properties)
+        }
+    except Exception as e:
+        print(f"❌ Error in get_rent_paid_properties: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")

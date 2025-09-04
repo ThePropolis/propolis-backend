@@ -73,6 +73,9 @@ class GuestyToken:
         access_token = body.get("access_token")
         expires_in = body.get("expires_in", 86400)  # seconds
 
+        print(f"Token response body: {body}")
+        print(f"Access token: {access_token}")
+
         if not access_token:
             raise HTTPException(status_code=502, detail="No access_token in Guesty response")
 

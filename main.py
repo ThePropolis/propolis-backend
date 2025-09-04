@@ -69,6 +69,9 @@ async def welcome():
 @app.get("/api/guesty/listings")
 async def list_guesty_listings(token: str = Depends(token.get_guesty_token)):
 
+    print(f"Guesty token: {token}")
+    print(f"Token length: {len(token)}")
+    print(f"Token starts with: {token[:50]}...")
     listings_url = "https://open-api.guesty.com/v1/listings"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -81,7 +84,7 @@ async def list_guesty_listings(token: str = Depends(token.get_guesty_token)):
         resp.raise_for_status()
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=502, detail="Failed to fetch listings") from e
-    print(resp.json())
+    # print(resp.json())
     return resp.json()
 
 @app.get("/api/guesty/reservations")
@@ -118,6 +121,7 @@ async def list_guesty_users(token: str = Depends(token.get_guesty_token)):
 async def get_guesty_revenue(
     start_date: str = None, 
     end_date: str = None,
+    property_id: str = None,
     token: str = Depends(token.get_guesty_token)
 ):
     """Get revenue data from Guesty reservations with financial details."""
@@ -161,9 +165,18 @@ async def get_guesty_revenue(
     # Try different filtering strategies (matching PHP format)
     filtering_strategies = []
     
+    # Base filters that apply to all strategies
+    base_filters = []
+    if property_id:
+        base_filters.append({
+            "field": "listing._id",
+            "operator": "$eq", 
+            "value": property_id
+        })
+    
     if start_date and end_date:
         # Strategy 1: Filter by check-in date with confirmed status
-        strategy1 = [
+        strategy1 = base_filters + [
             {
                 "field": "checkIn",
                 "operator": "$gte", 
@@ -183,7 +196,7 @@ async def get_guesty_revenue(
         filtering_strategies.append(("checkIn_confirmed", strategy1))
         
         # Strategy 2: Filter reservations that overlap with the date range (confirmed only)
-        strategy2 = [
+        strategy2 = base_filters + [
             {
                 "field": "checkIn",
                 "operator": "$lte", 
@@ -203,7 +216,7 @@ async def get_guesty_revenue(
         filtering_strategies.append(("overlap_confirmed", strategy2))
         
         # Strategy 3: Filter by check-out date with confirmed status
-        strategy3 = [
+        strategy3 = base_filters + [
             {
                 "field": "checkOut",
                 "operator": "$gte", 
@@ -222,6 +235,17 @@ async def get_guesty_revenue(
         ]
         filtering_strategies.append(("checkOut_confirmed", strategy3))
     
+    # If no date range but property_id is specified, add a property-only filter
+    if not start_date and not end_date and property_id:
+        strategy_property_only = base_filters + [
+            {
+                "field": "status",
+                "operator": "$eq", 
+                "value": "confirmed"
+            }
+        ]
+        filtering_strategies.append(("property_only_confirmed", strategy_property_only))
+    
     all_reservations = []
     successful_strategy = None
     
@@ -235,6 +259,8 @@ async def get_guesty_revenue(
                 print(f"DEBUG: Trying strategy: {strategy_name}")
                 print(f"DEBUG: Using date filter: {json.dumps(date_filter)}")
                 print(f"DEBUG: Start date: {start_date}, End date: {end_date}")
+                if property_id:
+                    print(f"DEBUG: Property ID filter: {property_id}")
                 
                 # Fetch all pages for this strategy
                 skip = 0
@@ -288,6 +314,11 @@ async def get_guesty_revenue(
             skip = 0
             limit = 100
             
+            # Prepare fallback filters (property_id only if specified)
+            fallback_filters = None
+            if property_id:
+                fallback_filters = json.dumps(base_filters)
+            
             while True:
                 params = {
                     "fields": " ".join(financial_fields),
@@ -295,6 +326,10 @@ async def get_guesty_revenue(
                     "skip": skip,
                     "sort": "-createdAt"
                 }
+                
+                # Add property filter if specified
+                if fallback_filters:
+                    params["filters"] = fallback_filters
                 
                 resp = await client.get(revenue_url, headers=headers, params=params)
                 resp.raise_for_status()
@@ -387,7 +422,8 @@ async def get_guesty_revenue(
                 "debug_info": {
                     "strategy_used": successful_strategy,
                     "total_reservations_fetched": len(all_reservations),
-                    "filters_applied": bool(start_date and end_date)
+                    "filters_applied": bool(start_date and end_date),
+                    "property_filter": property_id if property_id else None
                 }
             }
         }
