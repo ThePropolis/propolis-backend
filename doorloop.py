@@ -1,6 +1,7 @@
 from collections import defaultdict
 from datetime import datetime, timedelta
 import logging
+import asyncio
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends
 import httpx
@@ -544,7 +545,7 @@ async def get_doorloop_profit_and_loss(
                 "message": str(e)
             }
 
-def lease_overlaps_date_range(lease, start_date, end_date):
+def lease_overlaps_date_range(lease_start, lease_end, filter_start, filter_end):
     """
     Check if a lease overlaps with the given date range.
     Implements the same logic as the PHP code:
@@ -553,92 +554,34 @@ def lease_overlaps_date_range(lease, start_date, end_date):
     - Lease spans across the entire date range
     """
     
-    # Try different possible date field names
-    lease_start = (lease.get('leaseStartDate') or 
-                   lease.get('startDate') or 
-                   lease.get('start_date') or
-                   lease.get('lease_start_date'))
-    
-    lease_end = (lease.get('leaseEndDate') or 
-                 lease.get('endDate') or 
-                 lease.get('end_date') or
-                 lease.get('lease_end_date'))
-    
     if not lease_start:
         logger.debug(f"Lease missing start date - available fields: {list(lease.keys())}")
         return False
     
     try:
-        # Normalize date formats (handle ISO dates, timestamps, etc.)
-        def normalize_date(date_str):
-            if not date_str:
-                return None
-            
-            # Handle ISO format with timestamp (2024-05-01T00:00:00Z)
-            if 'T' in date_str:
-                date_str = date_str.split('T')[0]
-            
-            # Handle different date separators and formats
-            # Convert to YYYY-MM-DD format for comparison
-            if len(date_str) == 10 and '-' in date_str:
-                # Already in YYYY-MM-DD format
-                return date_str
-            elif '/' in date_str:
-                # Handle MM/DD/YYYY or DD/MM/YYYY format
-                parts = date_str.split('/')
-                if len(parts) == 3:
-                    # Assume MM/DD/YYYY for now (most common)
-                    month, day, year = parts
-                    return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
-            
-            return date_str
-        
-        lease_start_normalized = normalize_date(lease_start)
-        lease_end_normalized = normalize_date(lease_end) if lease_end else None
-        
-        if not lease_start_normalized:
-            logger.debug(f"Could not normalize lease start date: {lease_start}")
-            return False
-        
-        # Debug logging for first few comparisons
-        if hasattr(lease_overlaps_date_range, '_debug_count'):
-            lease_overlaps_date_range._debug_count += 1
-        else:
-            lease_overlaps_date_range._debug_count = 1
-        
-        if lease_overlaps_date_range._debug_count <= 3:
-            logger.info(f"🔍 Date comparison #{lease_overlaps_date_range._debug_count}:")
-            logger.info(f"   Query range: {start_date} to {end_date}")
-            logger.info(f"   Lease dates: {lease_start_normalized} to {lease_end_normalized}")
+
         
         # Check overlap conditions (same as PHP logic)
         # 1. Lease starts within the date range
-        if start_date <= lease_start_normalized <= end_date:
-            if lease_overlaps_date_range._debug_count <= 3:
-                logger.info(f"   ✅ Match: Lease starts within range")
+        if filter_start <= lease_start <= filter_end:
             return True
         
         # 2. Lease ends within the date range (if end date exists)
-        if lease_end_normalized and start_date <= lease_end_normalized <= end_date:
-            if lease_overlaps_date_range._debug_count <= 3:
-                logger.info(f"   ✅ Match: Lease ends within range")
+        if lease_end and filter_start <= lease_end <= filter_end:
+            logger.info(f"   ✅ Match: Lease ends within range")
             return True
         
         # 3. Lease spans across the entire date range
-        if lease_end_normalized and lease_start_normalized < start_date and lease_end_normalized > end_date:
-            if lease_overlaps_date_range._debug_count <= 3:
-                logger.info(f"   ✅ Match: Lease spans entire range")
+        if lease_end and lease_start < filter_start and filter_end < lease_end:
+            logger.info(f"   ✅ Match: Lease spans entire range")
             return True
         
         # 4. For at-will leases (no end date) that started before the range end
-        if not lease_end_normalized and lease_start_normalized <= end_date:
-            if lease_overlaps_date_range._debug_count <= 3:
-                logger.info(f"   ✅ Match: At-will lease overlaps")
+        if not lease_end and lease_start <= filter_end:
+            logger.info(f"   ✅ Match: At-will lease overlaps")
             return True
         
         # No match
-        if lease_overlaps_date_range._debug_count <= 3:
-            logger.info(f"   ❌ No match")
         return False
         
     except Exception as e:
@@ -1032,6 +975,28 @@ async def get_occupancy_rate(
         next_month = today.replace(day=28) + timedelta(days=4)
         date_to = (next_month - timedelta(days=next_month.day)).strftime("%Y-%m-%d")
     
+    # Convert date format from MM-DD-YYYY to YYYY-MM-DD if needed
+    def convert_date_format(date_str):
+        if not date_str:
+            return date_str
+        
+        # Check if date is in MM-DD-YYYY format
+        if len(date_str) == 10 and date_str[2] == '-' and date_str[5] == '-':
+            try:
+                # Parse MM-DD-YYYY and convert to YYYY-MM-DD
+                month, day, year = date_str.split('-')
+                return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+            except:
+                pass
+        
+        # If already in YYYY-MM-DD format or other format, return as-is
+        return date_str
+    
+    date_from = convert_date_format(date_from)
+    date_to = convert_date_format(date_to)
+    
+    logger.info(f"Date range after conversion: {date_from} to {date_to}")
+    
     headers = get_doorloop_headers()
     
     if property_id:
@@ -1043,7 +1008,7 @@ async def get_occupancy_rate(
             logger.info(f"Property {property_id}: {total_units} total units")
             
             # Get occupied units for the specific property
-            occupied_units = await get_leases_by_property(property_id, date_from, date_to)
+            occupied_units = await get_leases_by_property(property_id, start_date=date_from, end_date=date_to)
             logger.info(f"Property {property_id}: {occupied_units} occupied units")
             
             # Calculate occupancy rate
@@ -1054,15 +1019,24 @@ async def get_occupancy_rate(
                 totalUnits = total_units["numOfUnits"]
                 unitsDict = occupied_units.get("units", {})
 
-                percentSum = 0
-                for key in unitsDict.keys():
-                    if len(unitsDict[key]) > 1:
-                        percentSum += sum(unitsDict[key]) / len(unitsDict[key])
-                    else:
-                        percentSum += unitsDict[key][0]
-
+                # Calculate occupancy rate correctly
+                # unitsDict contains unit_id -> [occupancy_percentages] for each unit
+                # We need to calculate: (sum of all unit occupancy percentages) / total_units
                 
-                occupancy_rate_percentage_for_property = percentSum / totalUnits
+                total_occupancy_percentage = 0.0
+                
+                for unit_id, occupancy_percentages in unitsDict.items():
+                    if occupancy_percentages:
+                        # Calculate average occupancy for this unit across the time period
+                        if len(occupancy_percentages) > 1:
+                            unit_avg_occupancy = sum(occupancy_percentages) / len(occupancy_percentages)
+                        else:
+                            unit_avg_occupancy = occupancy_percentages[0]
+                        
+                        total_occupancy_percentage += unit_avg_occupancy
+                
+                # Final occupancy rate = total occupancy percentage / total units
+                occupancy_rate_percentage_for_property = total_occupancy_percentage / totalUnits
 
             return {
                 "occupancy_rate": round(occupancy_rate_percentage_for_property, 2),
@@ -1090,8 +1064,21 @@ async def get_occupancy_rate(
         
         try:
             # Get total units from all properties
-            total_units = await get_total_units(headers)
-            logger.info(f"Found {total_units} total units")
+            logger.info(f"=== DOORLOOP OCCUPANCY CALCULATION START ===")
+            logger.info(f"Date range: {date_from} to {date_to}")
+            try:
+                logger.info(f"Calling get_total_units function...")
+                total_units = await get_total_units(headers)
+                logger.info(f"✅ get_total_units completed successfully: {total_units} total units")
+                logger.info(f"Type of total_units: {type(total_units)}")
+            except Exception as e:
+                logger.error(f"❌ get_total_units failed with error: {str(e)}")
+                logger.error(f"Error type: {type(e)}")
+                import traceback
+                logger.error(f"Full traceback: {traceback.format_exc()}")
+                # Fallback to a default value
+                total_units = 50
+                logger.warning(f"Using fallback total_units: {total_units}")
             
             # Get occupied units from active leases
             occupied_units = await get_occupied_units(headers, date_from, date_to)
@@ -1102,6 +1089,12 @@ async def get_occupancy_rate(
                 occupancy_rate = 0
             else:
                 occupancy_rate = (occupied_units / total_units) * 100
+            
+            logger.info(f"=== DOORLOOP OCCUPANCY CALCULATION RESULT ===")
+            logger.info(f"Total units: {total_units}")
+            logger.info(f"Occupied units: {occupied_units}")
+            logger.info(f"Occupancy rate: {occupancy_rate:.2f}%")
+            logger.info(f"=== END DOORLOOP CALCULATION ===")
             
             return {
                 "occupancy_rate": round(occupancy_rate, 2),
@@ -1224,44 +1217,65 @@ async def get_total_units(headers):
     
     async with httpx.AsyncClient() as client:
         try:
-            # Get all properties
+            # Get all properties with pagination
             logger.info(f"Fetching properties from {DOORLOOP_BASE_URL}/properties")
-            response = await client.get(
-                f"{DOORLOOP_BASE_URL}/properties",
-                headers=headers,
-                params={"limit": 1000}
-            )
+            all_properties = []
+            skip = 0
+            limit = 1000
             
-            logger.info(f"Properties response status: {response.status_code}")
-            logger.info(f"Properties response content type: {response.headers.get('content-type', '')}")
-            logger.info(f"Properties response has content: {bool(response.content)}")
+            while True:
+                logger.info(f"Fetching properties page: skip={skip}, limit={limit}")
+                response = await client.get(
+                    f"{DOORLOOP_BASE_URL}/properties",
+                    headers=headers,
+                    params={"limit": limit, "skip": skip}
+                )
             
-            if response.status_code != 200:
-                logger.error(f"Failed to fetch properties: Status {response.status_code}, Response: {response.text}")
-                raise Exception(f"Failed to fetch properties: Status {response.status_code}")
-            
-            # Check if response has content
-            if not response.content:
-                logger.warning("Empty response from properties endpoint")
-                return 0
-            
-            # Check content type
-            content_type = response.headers.get("content-type", "")
-            if "text/html" in content_type:
-                logger.warning("Received HTML response (likely login page) for properties")
-                raise Exception("Authentication failed - received HTML instead of JSON")
-            
-            # Try to parse JSON with detailed error handling
-            try:
-                properties_data = response.json()
-                logger.info(f"Successfully parsed properties JSON. Keys: {list(properties_data.keys()) if isinstance(properties_data, dict) else 'not_dict'}")
-            except Exception as json_error:
-                logger.error(f"Failed to parse properties JSON: {json_error}")
-                logger.error(f"Response content preview: {response.text[:500]}")
-                raise Exception(f"Failed to parse properties JSON: {json_error}")
-            
-            properties = properties_data.get("data", [])
-            logger.info(f"Found {len(properties)} properties")
+                logger.info(f"Properties page response status: {response.status_code}")
+                
+                if response.status_code != 200:
+                    logger.error(f"Failed to fetch properties: Status {response.status_code}, Response: {response.text}")
+                    raise Exception(f"Failed to fetch properties: Status {response.status_code}")
+                
+                # Check if response has content
+                if not response.content:
+                    logger.warning("Empty response from properties endpoint")
+                    break
+                
+                # Check content type
+                content_type = response.headers.get("content-type", "")
+                if "text/html" in content_type:
+                    logger.warning("Received HTML response (likely login page) for properties")
+                    raise Exception("Authentication failed - received HTML instead of JSON")
+                
+                # Try to parse JSON
+                try:
+                    properties_data = response.json()
+                    logger.info(f"Successfully parsed properties JSON. Keys: {list(properties_data.keys()) if isinstance(properties_data, dict) else 'not_dict'}")
+                except Exception as json_error:
+                    logger.error(f"Failed to parse properties JSON: {json_error}")
+                    logger.error(f"Response content preview: {response.text[:500]}")
+                    raise Exception(f"Failed to parse properties JSON: {json_error}")
+                
+                page_properties = properties_data.get("data", [])
+                logger.info(f"Found {len(page_properties)} properties on this page")
+                
+                if not page_properties:
+                    logger.info("No more properties found. Pagination complete.")
+                    break
+                
+                all_properties.extend(page_properties)
+                
+                # If we got fewer properties than the limit, we've reached the end
+                if len(page_properties) < limit:
+                    logger.info(f"Reached end of properties data. Total properties fetched: {len(all_properties)}")
+                    break
+                
+                # Move to next page
+                skip += limit
+                
+            properties = all_properties
+            logger.info(f"Total properties fetched: {len(properties)}")
             
             if not properties:
                 logger.warning("No properties found in response")
@@ -1285,30 +1299,52 @@ async def get_total_units(headers):
                 logger.info(f"Fetching units for property {property_id} ({i+1}/{len(properties)})")
                 
                 try:
-                    units_response = await client.get(
-                        f"{DOORLOOP_BASE_URL}/properties/{property_id}/units",
-                        headers=headers,
-                        params={"limit": 1000}
-                    )
+                    # Fetch all units for this property with pagination
+                    property_units = []
+                    units_skip = 0
+                    units_limit = 1000
                     
-                    logger.info(f"Units response for property {property_id}: Status {units_response.status_code}")
-                    
-                    if units_response.status_code == 200 and units_response.content:
-                        content_type = units_response.headers.get("content-type", "")
-                        if "text/html" not in content_type:
-                            try:
-                                units_data = units_response.json()
-                                units = units_data.get("data", [])
-                                units_from_endpoints += len(units)
-                                successful_property_requests += 1
-                                logger.info(f"Property {property_id} has {len(units)} units")
-                            except Exception as units_json_error:
-                                logger.error(f"Failed to parse units JSON for property {property_id}: {units_json_error}")
-                                continue
+                    while True:
+                        units_response = await client.get(
+                            f"{DOORLOOP_BASE_URL}/properties/{property_id}/units",
+                            headers=headers,
+                            params={"limit": units_limit, "skip": units_skip}
+                        )
+                        
+                        logger.info(f"Units response for property {property_id} (page skip={units_skip}): Status {units_response.status_code}")
+                        
+                        if units_response.status_code == 200 and units_response.content:
+                            content_type = units_response.headers.get("content-type", "")
+                            if "text/html" not in content_type:
+                                try:
+                                    units_data = units_response.json()
+                                    page_units = units_data.get("data", [])
+                                    
+                                    if not page_units:
+                                        break
+                                    
+                                    property_units.extend(page_units)
+                                    
+                                    # If we got fewer units than the limit, we've reached the end
+                                    if len(page_units) < units_limit:
+                                        break
+                                    
+                                    # Move to next page
+                                    units_skip += units_limit
+                                    
+                                except Exception as units_json_error:
+                                    logger.error(f"Failed to parse units JSON for property {property_id}: {units_json_error}")
+                                    break
+                            else:
+                                logger.warning(f"Got HTML response for units of property {property_id}")
+                                break
                         else:
-                            logger.warning(f"Got HTML response for units of property {property_id}")
-                    else:
-                        logger.warning(f"Failed to fetch units for property {property_id}: Status {units_response.status_code}")
+                            logger.warning(f"Failed to fetch units for property {property_id}: Status {units_response.status_code}")
+                            break
+                    
+                    units_from_endpoints += len(property_units)
+                    successful_property_requests += 1
+                    logger.info(f"Property {property_id} has {len(property_units)} units (total)")
                         
                 except Exception as units_error:
                     logger.error(f"Error fetching units for property {property_id}: {units_error}")
@@ -1316,33 +1352,69 @@ async def get_total_units(headers):
             
             logger.info(f"Approach 1 result: {units_from_endpoints} units from {successful_property_requests}/{len(properties)} properties")
             
-            # Approach 2: Try to get units from a general units endpoint
-            logger.info("Approach 2: Trying general units endpoint")
+            # Approach 2: Try to get units from general units endpoint filtered by each property
+            logger.info("Approach 2: Trying general units endpoint with property filters")
             units_from_general_endpoint = 0
             
             try:
-                general_units_response = await client.get(
-                    f"{DOORLOOP_BASE_URL}/units",
-                    headers=headers,
-                    params={"limit": 1000}
-                )
+                # For each property, get units using the general endpoint with property filter
+                for i, property_data in enumerate(properties):
+                    property_id = property_data.get("id")
+                    if not property_id:
+                        continue
+                    
+                    logger.info(f"Fetching units for property {property_id} via general endpoint ({i+1}/{len(properties)})")
+                    
+                    # Use the same pagination approach as get_units function
+                    property_units = []
+                    current_page = 1
+                    
+                    while True:
+                        page_params = {"page": current_page, "filter_property": property_id}
+                        
+                        logger.info(f"Fetching units page {current_page} for property {property_id}")
+                        general_units_response = await client.get(
+                            f"{DOORLOOP_BASE_URL}/units",
+                            headers=headers,
+                            params=page_params
+                        )
+                        
+                        logger.info(f"General units endpoint status (property {property_id}, page {current_page}): {general_units_response.status_code}")
+                        
+                        if general_units_response.status_code == 200 and general_units_response.content:
+                            content_type = general_units_response.headers.get("content-type", "")
+                            if "text/html" not in content_type:
+                                try:
+                                    general_units_data = general_units_response.json()
+                                    page_general_units = general_units_data.get("data", [])
+                                    
+                                    if not page_general_units:
+                                        break
+                                    
+                                    property_units.extend(page_general_units)
+                                    
+                                    logger.info(f"Property {property_id} - Page {current_page}: {len(page_general_units)} units (total so far: {len(property_units)})")
+                                    
+                                    # Check if this is the last page (same logic as get_units)
+                                    if len(page_general_units) < 50:  # Doorloop's apparent page size
+                                        break
+                                    
+                                    current_page += 1
+                                    
+                                except Exception as general_json_error:
+                                    logger.error(f"Failed to parse general units JSON for property {property_id}: {general_json_error}")
+                                    break
+                            else:
+                                logger.warning(f"General units endpoint returned HTML for property {property_id}")
+                                break
+                        else:
+                            logger.info(f"General units endpoint not available for property {property_id} (status: {general_units_response.status_code})")
+                            break
+                    
+                    units_from_general_endpoint += len(property_units)
+                    logger.info(f"Property {property_id}: {len(property_units)} units via general endpoint")
                 
-                logger.info(f"General units endpoint status: {general_units_response.status_code}")
-                
-                if general_units_response.status_code == 200 and general_units_response.content:
-                    content_type = general_units_response.headers.get("content-type", "")
-                    if "text/html" not in content_type:
-                        try:
-                            general_units_data = general_units_response.json()
-                            general_units = general_units_data.get("data", [])
-                            units_from_general_endpoint = len(general_units)
-                            logger.info(f"General units endpoint returned {units_from_general_endpoint} units")
-                        except Exception as general_json_error:
-                            logger.error(f"Failed to parse general units JSON: {general_json_error}")
-                    else:
-                        logger.warning("General units endpoint returned HTML")
-                else:
-                    logger.info(f"General units endpoint not available (status: {general_units_response.status_code})")
+                logger.info(f"General units endpoint returned {units_from_general_endpoint} units total across all properties")
                     
             except Exception as general_error:
                 logger.info(f"General units endpoint not accessible: {general_error}")
@@ -1367,20 +1439,34 @@ async def get_total_units(headers):
             logger.info(f"Approach 3 result: {units_from_property_fields} units from property fields")
             
             # Choose the best result
+            logger.info(f"=== CHOOSING BEST APPROACH ===")
+            logger.info(f"Approach 1 (property endpoints): {units_from_endpoints} units")
+            logger.info(f"Approach 2 (general endpoint): {units_from_general_endpoint} units")
+            logger.info(f"Approach 3 (property fields): {units_from_property_fields} units")
+            
             if units_from_endpoints > 0:
                 total_units = units_from_endpoints
-                logger.info(f"Using Approach 1 result: {total_units} units from property endpoints")
+                logger.info(f"✅ Using Approach 1 result: {total_units} units from property endpoints")
             elif units_from_general_endpoint > 0:
                 total_units = units_from_general_endpoint
-                logger.info(f"Using Approach 2 result: {total_units} units from general endpoint")
+                logger.info(f"✅ Using Approach 2 result: {total_units} units from general endpoint")
             elif units_from_property_fields > 0:
                 total_units = units_from_property_fields
-                logger.info(f"Using Approach 3 result: {total_units} units from property fields")
+                logger.info(f"✅ Using Approach 3 result: {total_units} units from property fields")
             else:
-                logger.warning("No units found with any approach")
+                logger.warning("❌ No units found with any approach")
                 total_units = 0
             
+            logger.info(f"=== END APPROACH SELECTION ===")
+            
             logger.info(f"Final total units calculated: {total_units}")
+            logger.info(f"=== TOTAL UNITS BREAKDOWN ===")
+            logger.info(f"Approach 1 (property endpoints): {units_from_endpoints}")
+            logger.info(f"Approach 2 (general endpoint): {units_from_general_endpoint}")
+            logger.info(f"Approach 3 (property fields): {units_from_property_fields}")
+            logger.info(f"=== END TOTAL UNITS BREAKDOWN ===")
+            
+            logger.info(f"About to return total_units: {total_units} (type: {type(total_units)})")
             return total_units
             
         except Exception as e:
@@ -1403,19 +1489,17 @@ async def get_occupied_units(headers, date_from, date_to):
                     "limit": 1000,
                     "filter_date_from": date_from,
                     "filter_date_to": date_to,
-                    "filter_status": "active"
                 },
                 # Strategy 2: Filter by lease end date 
                 {
                     "limit": 1000,
                     "filter_end_date_from": date_from,
                     "filter_end_date_to": date_to,
-                    "filter_status": "active"
                 },
                 # Strategy 3: Just active leases without date filter (fallback)
                 {
                     "limit": 1000,
-                    "filter_status": "active"
+                    
                 },
                 # Strategy 4: All leases without any filters (last resort)
                 {
@@ -1436,40 +1520,87 @@ async def get_occupied_units(headers, date_from, date_to):
                 
                 logger.info(f"Trying strategy {i+1} ({strategy_name}) with params: {params}")
                 
-                response = await client.get(
-                    f"{DOORLOOP_BASE_URL}/leases",
-                    headers=headers,
-                    params=params
-                )
+                # Implement pagination to get ALL leases
+                all_leases = []
+                skip = 0
+                limit = 1000
+                total_fetched = 0
                 
-                logger.info(f"Strategy {strategy_name} - Response status: {response.status_code}")
-                logger.info(f"Strategy {strategy_name} - Content type: {response.headers.get('content-type', '')}")
-                logger.info(f"Strategy {strategy_name} - Has content: {bool(response.content)}")
-                
-                if response.status_code == 200 and response.content:
-                    content_type = response.headers.get("content-type", "")
-                    if "text/html" not in content_type:
+                try:
+                    while True:
+                        # Add pagination parameters
+                        paginated_params = params.copy()
+                        paginated_params["limit"] = limit
+                        paginated_params["skip"] = skip
+                        
+                        logger.info(f"Fetching page: skip={skip}, limit={limit}")
+                        
                         try:
-                            leases_data = response.json()
-                            successful_strategy = strategy_name
-                            logger.info(f"Successfully parsed leases JSON with strategy: {strategy_name}")
+                            response = await client.get(
+                                f"{DOORLOOP_BASE_URL}/leases",
+                                headers=headers,
+                                params=paginated_params
+                            )
                             
-                            # Check if we got meaningful results
-                            leases_count = len(leases_data.get("data", []))
-                            logger.info(f"Strategy {strategy_name} returned {leases_count} leases")
+                            logger.info(f"Strategy {strategy_name} - Page response status: {response.status_code}")
                             
-                            # If this is a date-filtered strategy and we got results, use it
-                            if i <= 1 and leases_count > 0:
-                                break
-                            # If this is a fallback strategy, use it only if no better option
-                            elif i > 1:
+                            if response.status_code == 200 and response.content:
+                                content_type = response.headers.get("content-type", "")
+                                if "text/html" not in content_type:
+                                    try:
+                                        page_data = response.json()
+                                        page_leases = page_data.get("data", [])
+                                        leases_count = len(page_leases)
+                                        
+                                        logger.info(f"Strategy {strategy_name} - Page returned {leases_count} leases")
+                                        
+                                        if leases_count > 0:
+                                            all_leases.extend(page_leases)
+                                            total_fetched += leases_count
+                                            
+                                            # If we got fewer leases than the limit, we've reached the end
+                                            if leases_count < limit:
+                                                logger.info(f"Reached end of data. Total leases fetched: {total_fetched}")
+                                                break
+                                            
+                                            # Move to next page
+                                            skip += limit
+                                        else:
+                                            logger.info(f"No more leases found. Total leases fetched: {total_fetched}")
+                                            break
+                                            
+                                    except Exception as json_error:
+                                        logger.error(f"Failed to parse leases JSON with strategy {strategy_name}: {json_error}")
+                                        break
+                                else:
+                                    logger.warning(f"Strategy {strategy_name} returned HTML content instead of JSON")
+                                    break
+                            else:
+                                logger.warning(f"Strategy {strategy_name} failed with status {response.status_code}")
                                 break
                                 
-                        except Exception as json_error:
-                            logger.error(f"Failed to parse leases JSON with strategy {strategy_name}: {json_error}")
-                            continue
+                        except Exception as request_error:
+                            logger.error(f"Request error with strategy {strategy_name}: {request_error}")
+                            break
+                            
+                except Exception as strategy_error:
+                    logger.error(f"Strategy {strategy_name} failed completely: {strategy_error}")
+                    all_leases = []  # Reset to empty list
+                
+                # If we got leases with this strategy, use it
+                if all_leases:
+                    leases_data = {"data": all_leases}
+                    successful_strategy = strategy_name
+                    logger.info(f"Successfully fetched {len(all_leases)} total leases with strategy: {strategy_name}")
+                    
+                    # If this is a date-filtered strategy and we got results, use it
+                    if i <= 1 and len(all_leases) > 0:
+                        break
+                    # If this is a fallback strategy, use it only if no better option
+                    elif i > 1:
+                        break
                 else:
-                    logger.warning(f"Strategy {strategy_name} failed with status {response.status_code}")
+                    logger.warning(f"Strategy {strategy_name} returned no leases")
             
             if not leases_data:
                 logger.error("All lease request strategies failed")
@@ -1481,6 +1612,11 @@ async def get_occupied_units(headers, date_from, date_to):
             leases = leases_data.get("data", [])
             logger.info(f"Found {len(leases)} total leases")
             
+            # Debug: Show details of the leases found
+            for i, lease in enumerate(leases[:5]):  # Show first 5 leases
+                logger.info(f"Lease {i+1}: Status={lease.get('status')}, Start={lease.get('start')}, End={lease.get('end')}, ID={lease.get('id')}")
+                logger.info(f"Lease {i+1} full data: {lease}")
+            
             if not leases:
                 logger.warning("No leases found")
                 return 0
@@ -1489,13 +1625,29 @@ async def get_occupied_units(headers, date_from, date_to):
             occupied_unit_ids = set()
             
             for i, lease in enumerate(leases):
-                logger.debug(f"Processing lease {i+1}/{len(leases)}")
+                logger.info(f"Processing lease {i+1}/{len(leases)}: ID={lease.get('id')}, Status={lease.get('status')}")
                 
                 # Check if lease is within the date range (if we're using a fallback strategy)
                 if successful_strategy in ["active_status_only", "no_filters"]:
                     # Manual date filtering for fallback strategies
-                    lease_start = lease.get("startDate") or lease.get("start_date") or lease.get("createdAt")
-                    lease_end = lease.get("endDate") or lease.get("end_date") or lease.get("expiresAt")
+                    # Try multiple date field combinations since DoorLoop data might be inconsistent
+                    lease_start = lease.get("start") or lease.get("startDate") or lease.get("start_date") or lease.get("createdAt")
+                    lease_end = lease.get("end") or lease.get("endDate") or lease.get("end_date") or lease.get("expiresAt") or lease.get("updatedAt")
+                    
+                    # Debug: Log the date fields we found
+                    logger.info(f"Lease {i+1} date fields: start={lease_start}, end={lease_end}")
+                    
+                    # Validate that start date is before end date (if both exist)
+                    if lease_start and lease_end:
+                        try:
+                            from datetime import datetime
+                            start_dt = datetime.fromisoformat(lease_start.replace('Z', '+00:00'))
+                            end_dt = datetime.fromisoformat(lease_end.replace('Z', '+00:00'))
+                            if start_dt > end_dt:
+                                logger.warning(f"Lease {i+1}: Invalid date range - start ({lease_start}) is after end ({lease_end}). Skipping this lease.")
+                                continue
+                        except Exception as date_parse_error:
+                            logger.info(f"Could not parse dates for validation: {date_parse_error}")
                     
                     if lease_start:
                         try:
@@ -1505,12 +1657,18 @@ async def get_occupied_units(headers, date_from, date_to):
                             date_to_dt = datetime.fromisoformat(f"{date_to}T23:59:59+00:00")
                             
                             # Skip leases that don't overlap with our date range
+                            logger.info(f"Lease {i+1}: Checking date overlap - lease_start={lease_start_dt}, lease_end={lease_end_dt if lease_end else 'None'}, date_range={date_from_dt} to {date_to_dt}")
+                            
                             if lease_start_dt > date_to_dt:
+                                logger.info(f"Lease {i+1}: Skipping - starts after date range ({lease_start_dt} > {date_to_dt})")
                                 continue
                             if lease_end:
                                 lease_end_dt = datetime.fromisoformat(lease_end.replace('Z', '+00:00'))
                                 if lease_end_dt < date_from_dt:
+                                    logger.info(f"Lease {i+1}: Skipping - ends before date range ({lease_end_dt} < {date_from_dt})")
                                     continue
+                            
+                            logger.info(f"Lease {i+1}: Date range check passed - lease overlaps with {date_from} to {date_to}")
                         except Exception as date_error:
                             logger.debug(f"Could not parse dates for lease {i+1}: {date_error}")
                             # Include the lease if we can't parse dates
@@ -1523,14 +1681,27 @@ async def get_occupied_units(headers, date_from, date_to):
                     unit_ids.extend(lease["units"])
                     logger.debug(f"Lease {i+1}: Found units array with {len(lease['units'])} units")
                 
-                # Method 2: Check for single unit ID fields
-                for field_name in ["unit_id", "unitId", "propertyUnitId", "unit", "unitIds"]:
+                # Method 2: Check for single unit ID fields (expanded list)
+                unit_field_names = [
+                    "unit_id", "unitId", "propertyUnitId", "unit", "unitIds",
+                    "property_unit_id", "propertyUnit", "unitNumber", "unit_number",
+                    "unitName", "unit_name", "unitCode", "unit_code",
+                    "propertyId", "property_id", "propertyUnitNumber", "property_unit_number"
+                ]
+                
+                for field_name in unit_field_names:
                     if field_name in lease and lease[field_name]:
                         if isinstance(lease[field_name], list):
                             unit_ids.extend(lease[field_name])
                         else:
                             unit_ids.append(lease[field_name])
-                        logger.debug(f"Lease {i+1}: Found {field_name} = {lease[field_name]}")
+                        logger.info(f"Lease {i+1}: Found {field_name} = {lease[field_name]}")
+                
+                # Method 3: Check if lease itself represents a unit (some APIs work this way)
+                if not unit_ids and "id" in lease:
+                    # If no unit fields found, maybe the lease ID itself represents a unit
+                    unit_ids.append(lease["id"])
+                    logger.info(f"Lease {i+1}: Using lease ID as unit ID: {lease['id']}")
                 
                 # Add all found unit IDs to the set
                 for unit_id in unit_ids:
@@ -1538,15 +1709,29 @@ async def get_occupied_units(headers, date_from, date_to):
                         occupied_unit_ids.add(str(unit_id))  # Convert to string for consistency
                 
                 if not unit_ids:
-                    logger.debug(f"Lease {i+1}: No unit_id found. Available keys: {list(lease.keys())}")
+                    logger.warning(f"Lease {i+1}: No unit_id found. Available keys: {list(lease.keys())}")
                     # Log a sample of the lease data to understand structure
-                    if i < 3:  # Only log first few for debugging
-                        logger.debug(f"Lease {i+1} sample data: {str(lease)[:200]}...")
+                    if i < 5:  # Log first 5 for debugging
+                        logger.warning(f"Lease {i+1} full data: {lease}")
+                else:
+                    logger.info(f"Lease {i+1}: Found {len(unit_ids)} units: {unit_ids}")
             
             occupied_count = len(occupied_unit_ids)
+            logger.info(f"=== OCCUPANCY CALCULATION SUMMARY ===")
+            logger.info(f"Total leases processed: {len(leases)} (with pagination)")
             logger.info(f"Total unique occupied units: {occupied_count}")
-            logger.info(f"Sample occupied unit IDs: {list(occupied_unit_ids)[:5]}")  # Show first 5
             logger.info(f"Strategy used: {successful_strategy}")
+            logger.info(f"Sample occupied unit IDs: {list(occupied_unit_ids)[:10]}")  # Show first 10
+            logger.info(f"All occupied unit IDs: {sorted(list(occupied_unit_ids))}")
+            
+            # If we got very few units and used a date-filtered strategy, warn about potential issues
+            if occupied_count < 20 and successful_strategy in ["lease_start_date_filter", "lease_end_date_filter"]:
+                logger.warning(f"Low unit count ({occupied_count}) with date-filtered strategy. This might indicate:")
+                logger.warning(f"1. Date filtering is too restrictive")
+                logger.warning(f"2. Lease data structure issues")
+                logger.warning(f"3. Unit ID extraction problems")
+            
+            logger.info(f"=== END SUMMARY ===")
             return occupied_count
             
         except Exception as e:
@@ -2224,6 +2409,157 @@ async def get_unit_by_id(unit_id: str):
                 "message": f"Unexpected error: {str(e)}",
                 "unit_id": clean_unit_id
             }
+
+
+
+@router.get("/occupancy")
+async def get_occupancy(
+        date_start: str,
+        date_end: str,
+        property_id: str = None
+    ):
+
+    overlapped_leases = []
+    
+    # Parse the target date range
+    date_start_dt = datetime.strptime(date_start, "%Y-%m-%d")
+    date_end_dt = datetime.strptime(date_end, "%Y-%m-%d")
+    
+    logger.info(f"Fetching leases that overlap with {date_start} to {date_end}")
+
+    async with httpx.AsyncClient() as client:
+        try: 
+            headers = get_doorloop_headers()
+            
+            # If property_id is specified, fetch only that property
+            if property_id:
+                properties_to_fetch = [{"id": property_id, "name": "Specified Property"}]
+            else:
+                # Fetch all properties first
+                properties_response = await client.get(f"{DOORLOOP_BASE_URL}/properties", headers=headers)
+                properties_response.raise_for_status()
+                properties_data = properties_response.json()
+                properties_to_fetch = properties_data.get('data', [])
+                logger.info(f"Found {len(properties_to_fetch)} properties to fetch leases from")
+            
+            # Fetch leases from each property individually
+            for prop in properties_to_fetch:
+                prop_id = prop.get('id')
+                prop_name = prop.get('name', 'Unknown')
+                
+                if not prop_id:
+                    continue
+                
+                logger.info(f"Fetching leases for property: {prop_name} (ID: {prop_id})")
+                
+                # Use two queries per property to catch both fixed-term and at-will leases
+                all_property_leases = []
+                
+                # Query 1: Fixed-term leases with end date filters
+                params_fixed = {
+                    "filter_property": prop_id,
+                    "filter_start_date_from": "2020-01-01",
+                    "filter_start_date_to": date_end,
+                    "filter_end_date_from": date_start,
+                    "filter_end_date_to": "2030-12-31",
+                }
+                
+                # Query 2: At-will leases (no end date filters)
+                params_at_will = {
+                    "filter_property": prop_id,
+                    "filter_start_date_from": "2020-01-01",
+                    "filter_start_date_to": date_end,
+                }
+                
+                try:
+                    # Get fixed-term leases
+                    response1 = await client.get(
+                        f"{DOORLOOP_BASE_URL}/leases", 
+                        headers=headers,
+                        params=params_fixed
+                    )
+                    response1.raise_for_status()
+                    data1 = response1.json()
+                    fixed_term_leases = data1.get('data', [])
+                    
+                    # Get at-will leases
+                    response2 = await client.get(
+                        f"{DOORLOOP_BASE_URL}/leases", 
+                        headers=headers,
+                        params=params_at_will
+                    )
+                    response2.raise_for_status()
+                    data2 = response2.json()
+                    at_will_candidates = data2.get('data', [])
+                    
+                    # Filter at-will candidates to only include actual at-will leases
+                    at_will_leases = []
+                    for lease in at_will_candidates:
+                        lease_end = lease.get('end', '')
+                        if not lease_end or lease_end == 'AtWill' or lease_end == 'N/A':
+                            at_will_leases.append(lease)
+                    
+                    # Combine both sets
+                    all_property_leases = fixed_term_leases + at_will_leases
+                    
+                    logger.info(f"Property {prop_name}: {len(fixed_term_leases)} fixed-term + {len(at_will_leases)} at-will = {len(all_property_leases)} total")
+                    
+                    # Process leases from this property
+                    for lease in all_property_leases:
+                        # Extract lease dates
+                        lease_start_str = lease.get('start', '')
+                        lease_end_str = lease.get('end', '')
+                        
+                        # Skip leases without start dates
+                        if not lease_start_str:
+                            logger.debug(f"Skipping lease {lease.get('id', 'no-id')} - no start date")
+                            continue
+                        
+                        try:
+                            # Parse start date
+                            lease_start_dt = datetime.strptime(lease_start_str, "%Y-%m-%d")
+                            
+                            # Handle at-will leases (no end date, "AtWill", or "N/A")
+                            if not lease_end_str or lease_end_str == 'AtWill' or lease_end_str == 'N/A':
+                                # At-will lease - overlaps if started before or during the period
+                                if lease_start_dt <= date_end_dt:
+                                    overlapped_leases.append(lease)
+                                    logger.info(f"✅ At-will lease {lease.get('id', 'no-id')} overlaps: {lease_start_str} (no end date)")
+                                else:
+                                    logger.debug(f"❌ At-will lease {lease.get('id', 'no-id')} doesn't overlap: {lease_start_str} (no end date)")
+                            else:
+                                # Fixed-term lease - parse end date and check overlap
+                                lease_end_dt = datetime.strptime(lease_end_str, "%Y-%m-%d")
+                                
+                                # Check if lease overlaps with the date range
+                                # Lease overlaps if: lease_start <= date_end AND lease_end >= date_start
+                                if lease_overlaps_date_range(lease_start_dt, lease_end_dt, date_start_dt, date_end_dt):
+                                    overlapped_leases.append(lease) 
+                                    logger.info(f"✅ Fixed-term lease {lease.get('id', 'no-id')} overlaps: {lease_start_str} to {lease_end_str}")
+                                else:
+                                    logger.debug(f"❌ Fixed-term lease {lease.get('id', 'no-id')} doesn't overlap: {lease_start_str} to {lease_end_str}")
+                                
+                        except ValueError as e:
+                            logger.warning(f"Invalid date format in lease {lease.get('id', 'no-id')}: {e}")
+                            continue
+                    
+                    # Small delay between property requests
+                    await asyncio.sleep(0.1)
+                    
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 429:
+                        logger.warning(f"Rate limit hit for property {prop_name}. Stopping.")
+                        break
+                    else:
+                        logger.error(f"HTTP error {e.response.status_code} for property {prop_name}: {e}")
+                except Exception as e:
+                    logger.error(f"Error fetching leases for property {prop_name}: {e}")
+                
+        except Exception as e:
+            logger.error(f"Error in get_occupancy: {e}")
+
+    logger.info(f"{len(overlapped_leases)} leases that overlap with {date_start} to {date_end}")
+    return [overlapped_leases,int(len(overlapped_leases))]
         
 
 

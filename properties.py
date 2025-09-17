@@ -240,10 +240,22 @@ async def get_units_for_property(
 ):
     """Get all units for a specific property from Supabase"""
     try:
+        # Enhanced debugging for deployment issues
+        print(f"🔍 Environment check - SUPABASE_URL exists: {bool(os.getenv('SUPABASE_URL'))}")
+        print(f"🔍 Environment check - SUPABASE_KEY exists: {bool(os.getenv('SUPABASE_KEY'))}")
+        
         # Parse property name to remove "Apartments" suffix
         parsed_property = property.replace(" Apartments", "").replace("Apartments", "")
         print(f"🔍 Original property: {property}")
         print(f"🔍 Parsed property: {parsed_property}")
+        
+        # Test database connection first
+        try:
+            test_response = supabase.table("STR-Jul-2025").select("Property").limit(1).execute()
+            print(f"🔍 Database connection test successful")
+        except Exception as db_test_error:
+            print(f"❌ Database connection test failed: {str(db_test_error)}")
+            raise HTTPException(status_code=500, detail=f"Database connection failed: {str(db_test_error)}")
         
         # Build the query step by step
         query = supabase.table("STR-Jul-2025").select("Unit")
@@ -254,11 +266,24 @@ async def get_units_for_property(
         
         print(f"🔍 Response received: {len(response.data) if response.data else 0} units found")
         
+        # Additional debugging - check if table exists and has data
+        if not response.data:
+            # Try to get all properties to see what's available
+            all_props_response = supabase.table("STR-Jul-2025").select("Property").execute()
+            available_properties = list(set([prop.get("Property") for prop in (all_props_response.data or []) if prop.get("Property")]))
+            print(f"🔍 Available properties in database: {available_properties[:10]}")  # Show first 10
+            print(f"🔍 Total properties in database: {len(available_properties)}")
+        
         return {
             "data": response.data or [],
             "count": len(response.data) if response.data else 0,
             "property": property,
-            "parsed_property": parsed_property
+            "parsed_property": parsed_property,
+            "debug_info": {
+                "database_connected": True,
+                "table_exists": bool(response.data is not None),
+                "available_properties_count": len(set([prop.get("Property") for prop in (supabase.table("STR-Jul-2025").select("Property").execute().data or []) if prop.get("Property")])) if response.data is not None else 0
+            }
         }
     except Exception as e:
         print(f"❌ Error in get_units_for_property: {str(e)}")
@@ -405,3 +430,65 @@ async def get_rent_paid_properties():
     except Exception as e:
         print(f"❌ Error in get_rent_paid_properties: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@router.get("/db/health-check")
+async def database_health_check():
+    """Comprehensive database health check for deployment debugging"""
+    try:
+        health_info = {
+            "environment": {
+                "supabase_url_exists": bool(os.getenv("SUPABASE_URL")),
+                "supabase_key_exists": bool(os.getenv("SUPABASE_KEY")),
+                "supabase_url_length": len(os.getenv("SUPABASE_URL", "")),
+                "supabase_key_length": len(os.getenv("SUPABASE_KEY", ""))
+            },
+            "tables": {},
+            "errors": []
+        }
+        
+        # Test each table used by unit filtering
+        tables_to_check = ["STR-Jul-2025", "Rent-Paid-July-2025"]
+        
+        for table_name in tables_to_check:
+            try:
+                # Test basic connection
+                test_response = supabase.table(table_name).select("*").limit(1).execute()
+                health_info["tables"][table_name] = {
+                    "exists": True,
+                    "accessible": True,
+                    "has_data": bool(test_response.data),
+                    "sample_count": len(test_response.data) if test_response.data else 0
+                }
+                
+                # Get column info if table exists
+                if test_response.data:
+                    sample_record = test_response.data[0]
+                    health_info["tables"][table_name]["columns"] = list(sample_record.keys())
+                    
+                    # For STR table, get unique properties
+                    if table_name == "STR-Jul-2025":
+                        props_response = supabase.table(table_name).select("Property").execute()
+                        unique_props = list(set([prop.get("Property") for prop in (props_response.data or []) if prop.get("Property")]))
+                        health_info["tables"][table_name]["unique_properties"] = unique_props[:10]  # First 10
+                        health_info["tables"][table_name]["total_properties"] = len(unique_props)
+                        
+            except Exception as table_error:
+                health_info["tables"][table_name] = {
+                    "exists": False,
+                    "accessible": False,
+                    "error": str(table_error)
+                }
+                health_info["errors"].append(f"Table {table_name}: {str(table_error)}")
+        
+        return {
+            "status": "healthy" if not health_info["errors"] else "unhealthy",
+            "health_info": health_info,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }

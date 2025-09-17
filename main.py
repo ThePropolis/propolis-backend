@@ -63,8 +63,17 @@ app.include_router(doorloop_router)
  
 @app.get("/")
 async def welcome():
-    await token.get_guesty_token()
     return "Hello, welcome to the Propolis Backend"
+
+@app.get("/health/guesty")
+async def guesty_health_check():
+    """Check Guesty API connectivity and circuit breaker status"""
+    circuit_status = token.get_circuit_breaker_status()
+    return {
+        "service": "Guesty API",
+        "circuit_breaker": circuit_status,
+        "status": "healthy" if circuit_status["status"] == "CLOSED" else "degraded"
+    }
 
 @app.get("/api/guesty/listings")
 async def list_guesty_listings(token: str = Depends(token.get_guesty_token)):
@@ -490,8 +499,7 @@ async def get_occupancy_rate(
 async def get_occupied_units(
         headers: dict, 
         date_from: str, 
-        date_to: str,
-        token: str = Depends(token.get_guesty_token)
+        date_to: str
     ):
     """
     Get count of unique properties that have confirmed reservations that overlap with the date range.
