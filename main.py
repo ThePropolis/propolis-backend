@@ -46,7 +46,7 @@ async def log_request_scheme(request: Request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:5174","https://propolis-frontend.vercel.app"],
+    allow_origins=["http://localhost:5173", "http://localhost:5174","https://propolis-frontend.vercel.app", "https://propolis-dashboard.com"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -134,6 +134,7 @@ async def get_guesty_revenue(
     token: str = Depends(token.get_guesty_token)
 ):
     """Get revenue data from Guesty reservations with financial details."""
+    logger.info(f"Starting revenue calculation for dates: {start_date} to {end_date}, property: {property_id}")
     revenue_url = "https://open-api.guesty.com/v1/reservations"
     
     # Financial fields to include in the response (matching PHP implementation)
@@ -440,7 +441,10 @@ async def get_guesty_revenue(
         return response_data
         
     except Exception as e:
-        print(f"DEBUG: Error in revenue calculation: {str(e)}")
+        logger.error(f"Error in revenue calculation: {str(e)}")
+        logger.error(f"Error type: {type(e)}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Error calculating revenue: {str(e)}")
     
 
