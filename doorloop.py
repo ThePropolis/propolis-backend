@@ -1081,7 +1081,7 @@ async def get_occupancy_rate(
                 logger.warning(f"Using fallback total_units: {total_units}")
             
             # Get occupied units from active leases
-            occupied_units = await get_occupied_units(headers, date_from, date_to)
+            occupied_units = await get_occupancy(date_from, date_to)
             logger.info(f"Found {occupied_units} occupied units")
             
             # Calculate occupancy rate
@@ -2412,7 +2412,7 @@ async def get_unit_by_id(unit_id: str):
 
 
 
-@router.get("/occupancy")
+# @router.get("/occupancy")
 async def get_occupancy(
         date_start: str,
         date_end: str,
@@ -2559,7 +2559,7 @@ async def get_occupancy(
             logger.error(f"Error in get_occupancy: {e}")
 
     logger.info(f"{len(overlapped_leases)} leases that overlap with {date_start} to {date_end}")
-    return [overlapped_leases,int(len(overlapped_leases))]
+    return int(len(overlapped_leases))
         
 
 
