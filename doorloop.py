@@ -1004,11 +1004,13 @@ async def get_occupancy_rate(
         
         try:
             # Get total units for the specific property
-            total_units = await get_units_by_property(property_id)
-            logger.info(f"Property {property_id}: {total_units} total units")
+            units_by_property_response = await get_units_by_property(property_id)
+            logger.info(f"Property {property_id}: {units_by_property_response} total units")
+
+            total_units = units_by_property_response.get("numOfUnits", 0)
             
             # Get occupied units for the specific property
-            occupied_units = await get_leases_by_property(property_id, start_date=date_from, end_date=date_to)
+            occupied_units = await get_occupancy(date_from, date_to, property_id)
             logger.info(f"Property {property_id}: {occupied_units} occupied units")
             
             # Calculate occupancy rate
@@ -1016,32 +1018,13 @@ async def get_occupancy_rate(
                 occupancy_rate = 0
 
             else:
-                totalUnits = total_units["numOfUnits"]
-                unitsDict = occupied_units.get("units", {})
-
-                # Calculate occupancy rate correctly
-                # unitsDict contains unit_id -> [occupancy_percentages] for each unit
-                # We need to calculate: (sum of all unit occupancy percentages) / total_units
-                
-                total_occupancy_percentage = 0.0
-                
-                for unit_id, occupancy_percentages in unitsDict.items():
-                    if occupancy_percentages:
-                        # Calculate average occupancy for this unit across the time period
-                        if len(occupancy_percentages) > 1:
-                            unit_avg_occupancy = sum(occupancy_percentages) / len(occupancy_percentages)
-                        else:
-                            unit_avg_occupancy = occupancy_percentages[0]
-                        
-                        total_occupancy_percentage += unit_avg_occupancy
-                
                 # Final occupancy rate = total occupancy percentage / total units
-                occupancy_rate_percentage_for_property = total_occupancy_percentage / totalUnits
+                occupancy_rate_percentage_for_property = occupied_units / total_units
 
             return {
                 "occupancy_rate": round(occupancy_rate_percentage_for_property, 2),
-                "occupied_units": len(unitsDict),
-                "total_units": totalUnits,
+                "occupied_units": occupied_units,
+                "total_units": total_units,
                 "date_from": date_from,
                 "date_to": date_to,
                 "percentage": f"{round(occupancy_rate_percentage_for_property, 2)}%"
@@ -1088,7 +1071,7 @@ async def get_occupancy_rate(
             if total_units == 0:
                 occupancy_rate = 0
             else:
-                occupancy_rate = (occupied_units / total_units) * 100
+                occupancy_rate = (occupied_units / total_units)
             
             logger.info(f"=== DOORLOOP OCCUPANCY CALCULATION RESULT ===")
             logger.info(f"Total units: {total_units}")
@@ -1214,6 +1197,9 @@ async def get_occupancy_rate(
 
 async def get_total_units(headers):
     """Get total number of units from all properties"""
+    
+    logger.info(f"=== STARTING get_total_units ===")
+    logger.info(f"Using DOORLOOP_BASE_URL: {DOORLOOP_BASE_URL}")
     
     async with httpx.AsyncClient() as client:
         try:
@@ -2420,12 +2406,16 @@ async def get_occupancy(
     ):
 
     overlapped_leases = []
+    unit_occupancy = {}  # Track occupancy percentage per unit
     
     # Parse the target date range
     date_start_dt = datetime.strptime(date_start, "%Y-%m-%d")
     date_end_dt = datetime.strptime(date_end, "%Y-%m-%d")
     
-    logger.info(f"Fetching leases that overlap with {date_start} to {date_end}")
+    # Calculate total days in the requested period
+    total_days = (date_end_dt - date_start_dt).days + 1  # +1 to include both dates
+    
+    logger.info(f"Fetching leases that overlap with {date_start} to {date_end} (total days: {total_days})")
 
     async with httpx.AsyncClient() as client:
         try: 
@@ -2519,10 +2509,17 @@ async def get_occupancy(
                             # Parse start date
                             lease_start_dt = datetime.strptime(lease_start_str, "%Y-%m-%d")
                             
+                            # Get unit ID for this lease
+                            unit_id = lease.get('unit', {}).get('id') if isinstance(lease.get('unit'), dict) else lease.get('unit')
+                            if not unit_id:
+                                unit_id = lease.get('id', 'unknown')  # Fallback to lease ID
+                            
                             # Handle at-will leases (no end date, "AtWill", or "N/A")
                             if not lease_end_str or lease_end_str == 'AtWill' or lease_end_str == 'N/A':
                                 # At-will lease - overlaps if started before or during the period
                                 if lease_start_dt <= date_end_dt:
+                                    # Track occupancy for this unit (binary: occupied or not)
+                                    unit_occupancy[unit_id] = 100  # At-will lease = 100% occupied
                                     overlapped_leases.append(lease)
                                     logger.info(f"✅ At-will lease {lease.get('id', 'no-id')} overlaps: {lease_start_str} (no end date)")
                                 else:
@@ -2531,11 +2528,28 @@ async def get_occupancy(
                                 # Fixed-term lease - parse end date and check overlap
                                 lease_end_dt = datetime.strptime(lease_end_str, "%Y-%m-%d")
                                 
-                                # Check if lease overlaps with the date range
-                                # Lease overlaps if: lease_start <= date_end AND lease_end >= date_start
-                                if lease_overlaps_date_range(lease_start_dt, lease_end_dt, date_start_dt, date_end_dt):
-                                    overlapped_leases.append(lease) 
+                                # Check if lease overlaps with the date range using the existing function
+                                # if lease_overlaps_date_range(lease_start_dt, lease_end_dt, date_start_dt, date_end_dt):
+                                if lease_start_dt <= date_start_dt and date_end_dt <= lease_end_dt:
+                                    # Track occupancy for this unit (binary: occupied or not)
+                                    unit_occupancy[unit_id] = 100  # Fixed-term lease = 100% occupied
+                                    overlapped_leases.append(lease)
                                     logger.info(f"✅ Fixed-term lease {lease.get('id', 'no-id')} overlaps: {lease_start_str} to {lease_end_str}")
+                                elif date_start_dt < lease_start_dt and date_end_dt < lease_end_dt:
+                                    days = (lease_start_dt - date_start_dt).days + 1
+                                    unit_occupancy[unit_id] = max(days / total_days * 100, unit_occupancy.get(unit_id, 0))
+                                    overlapped_leases.append(lease)
+                                    logger.info(f"✅ Fixed-term lease {lease.get('id', 'no-id')} overlaps: {lease_start_str} to {lease_end_str} - {days / total_days * 100:.1f}% occupancy")
+                                elif date_start_dt < lease_start_dt and date_end_dt > lease_end_dt:
+                                    days = (lease_end_dt - lease_start_dt).days + 1
+                                    unit_occupancy[unit_id] = max(days / total_days * 100, unit_occupancy.get(unit_id, 0))
+                                    overlapped_leases.append(lease)
+                                    logger.info(f"✅ Fixed-term lease {lease.get('id', 'no-id')} overlaps: {lease_start_str} to {lease_end_str} - {days / total_days * 100:.1f}% occupancy")
+                                elif lease_start_dt < date_start_dt and lease_end_dt < date_end_dt:
+                                    days = (date_end_dt - lease_end_dt).days + 1
+                                    unit_occupancy[unit_id] = max(days / total_days * 100, unit_occupancy.get(unit_id, 0))
+                                    overlapped_leases.append(lease)
+                                    logger.info(f"✅ Fixed-term lease {lease.get('id', 'no-id')} overlaps: {lease_start_str} to {lease_end_str} - {days / total_days * 100:.1f}% occupancy")
                                 else:
                                     logger.debug(f"❌ Fixed-term lease {lease.get('id', 'no-id')} doesn't overlap: {lease_start_str} to {lease_end_str}")
                                 
@@ -2558,8 +2572,15 @@ async def get_occupancy(
         except Exception as e:
             logger.error(f"Error in get_occupancy: {e}")
 
+    # Return count of occupied units (not percentage)
+    occupied_units_count = len(unit_occupancy)
+    
     logger.info(f"{len(overlapped_leases)} leases that overlap with {date_start} to {date_end}")
-    return int(len(overlapped_leases))
+    logger.info(f"Occupied units: {occupied_units_count}")
+    logger.info(f"Unit occupancy details: {unit_occupancy}")
+    occupancy = sum(unit_occupancy.values())
+    logger.info(f"Occupancy: {occupancy}")
+    return occupancy
         
 
 
