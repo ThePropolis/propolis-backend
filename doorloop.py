@@ -2536,7 +2536,7 @@ async def get_occupancy(
                                     overlapped_leases.append(lease)
                                     logger.info(f"✅ Fixed-term lease {lease.get('id', 'no-id')} overlaps: {lease_start_str} to {lease_end_str}")
                                 elif date_start_dt < lease_start_dt and date_end_dt < lease_end_dt:
-                                    days = (lease_start_dt - date_start_dt).days + 1
+                                    days = (date_end_dt - date_start_dt).days - (lease_start_dt - date_start_dt).days + 1
                                     unit_occupancy[unit_id] = max(days / total_days * 100, unit_occupancy.get(unit_id, 0))
                                     overlapped_leases.append(lease)
                                     logger.info(f"✅ Fixed-term lease {lease.get('id', 'no-id')} overlaps: {lease_start_str} to {lease_end_str} - {days / total_days * 100:.1f}% occupancy")
