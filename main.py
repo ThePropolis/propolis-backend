@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 from auth import router as auth_router
 from doorloop import router as doorloop_router
+from jurny import router as jurny_router
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta, timezone
 import logging
@@ -44,6 +45,7 @@ app.add_middleware(
 
 app.include_router(auth_router)
 app.include_router(doorloop_router)
+app.include_router(jurny_router)
 
 
 
@@ -51,13 +53,6 @@ app.include_router(doorloop_router)
 @app.get("/")
 async def welcome():
     return "Hello, welcome to the Propolis Backend"
-
-
-
-
-
-
-
 
 
 @app.get("/health")

@@ -2636,9 +2636,18 @@ async def get_avg_lease_tenancy(
                     }
 
 
-                    lease_resp = await client.get(f"{DOORLOOP_BASE_URL}/leases", headers=headers, params=params)
-                    lease_resp.raise_for_status()
-                    lease_data = lease_resp.json()
+                    try:
+                        lease_resp = await client.get(f"{DOORLOOP_BASE_URL}/leases", headers=headers, params=params)
+                        lease_resp.raise_for_status()
+                        lease_data = lease_resp.json()
+                    except httpx.HTTPStatusError as e:
+                        if e.response.status_code == 429:
+                            logger.warning(f"Rate limited (429) when fetching leases for unit {unit.get('id')}, skipping")
+                            continue
+                        else:
+                            logger.warning(f"HTTP error {e.response.status_code} when fetching leases for unit {unit.get('id')}: {str(e)}")
+                            continue
+                    
                     leases = lease_data.get('data', [])
                     for lease in leases: 
                         if not lease.get('start') or not lease.get('end'):
@@ -2678,13 +2687,20 @@ async def get_avg_lease_tenancy(
                         total_lease_duration += days
 
 
+                if total_leases == 0:
+                    return {"lease_count": 0, 
+                            "total_lease_duration": 0, 
+                            "property_id": property_id, 
+                            "average_lease_duration": 0}
+                
                 return {"lease_count": total_leases, 
                         "total_lease_duration": total_lease_duration, 
                         "property_id": property_id, 
                         "average_lease_duration": round(total_lease_duration / total_leases, 1)}
             
             except Exception as e:
-                raise HTTPException(status_code=404, detail="No lease data found for property")
+                logger.error(f"Error processing average lease tenancy for property {property_id}: {str(e)}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Error processing average lease tenancy: {str(e)}")
         else:
 
             total_leases = 0
@@ -2723,6 +2739,13 @@ async def get_avg_lease_tenancy(
                                 lease_resp = await client.get(f"{DOORLOOP_BASE_URL}/leases", headers=headers, params=params)
                                 lease_resp.raise_for_status()
                                 lease_data = lease_resp.json()
+                            except httpx.HTTPStatusError as e:
+                                if e.response.status_code == 429:
+                                    logger.warning(f"Rate limited (429) when fetching leases for unit {unit.get('id')}, skipping")
+                                    continue
+                                else:
+                                    logger.warning(f"HTTP error {e.response.status_code} when fetching leases for unit {unit.get('id')}: {str(e)}")
+                                    continue
 
                                 leases = lease_data.get('data', [])
                                 for lease in leases:
@@ -2762,18 +2785,26 @@ async def get_avg_lease_tenancy(
                                     total_lease_duration += days
 
                             except Exception as e:
-                                raise HTTPException(status_code=404, detail="No lease data found for unit")
+                                logger.warning(f"Error fetching lease data for unit {unit.get('id')}: {str(e)}")
+                                continue  # Continue to next unit instead of failing completely
 
                     except Exception as e:
-                            raise HTTPException(status_code=404, detail="No unit data found")
+                            logger.warning(f"Error fetching unit data for property {property.get('id')}: {str(e)}")
+                            continue  # Continue to next property instead of failing completely
 
+                if total_leases == 0:
+                    return {"lease_count": 0, 
+                            "total_lease_duration": 0, 
+                            "average_lease_duration": 0}
+                
                 return {"lease_count": total_leases, 
                         "total_lease_duration": total_lease_duration, 
                         "average_lease_duration": round(total_lease_duration / total_leases, 1)
                         }
                                                 
             except Exception as e:
-                raise HTTPException(status_code=404, detail="No property data found")
+                logger.error(f"Error fetching property data: {str(e)}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Error processing average lease tenancy: {str(e)}")
 
 
 
@@ -2786,11 +2817,16 @@ async def get_tenant_turnover(
 
     headers = get_doorloop_headers()
 
+    # Validate required parameters
+    if not date_from or not date_to:
+        raise HTTPException(status_code=400, detail="date_from and date_to are required")
+
      # Parse the target date range
     date_start_dt = datetime.strptime(date_from, "%Y-%m-%d")
     date_end_dt = datetime.strptime(date_to, "%Y-%m-%d")
 
     num_tenants_moved = 0
+    total_tenants = 0
 
     async with httpx.AsyncClient() as client:
 
@@ -2823,61 +2859,84 @@ async def get_tenant_turnover(
                         logger.info(f"Found {len(leases)} leases for unit {unit['id']}")
                         
                         for lease in leases: 
-                            if not lease.get('start') or not lease.get('end'):
+                            if not lease.get('start'):
                                 continue
-                                
+                            
+                            # Parse start date
                             try:
                                 lease_start_dt = datetime.strptime(lease['start'], "%Y-%m-%d")
-                                lease_end_dt = datetime.strptime(lease['end'], "%Y-%m-%d")
-                            except (ValueError, TypeError):
-                                logger.warning(f"Invalid date format in lease: {lease.get('start')}, {lease.get('end')}")
+                            except (ValueError, TypeError, KeyError):
+                                logger.warning(f"Invalid date format in lease start: {lease.get('start')}")
                                 continue
-
-                            if date_start_dt < lease_end_dt < date_end_dt:
-                                num_tenants_moved += 1
-                                logger.info(f"Tenant moved: lease {lease.get('id')} ended on {lease['end']}")
+                            
+                            # Handle leases with and without end dates
+                            lease_end = lease.get('end')
+                            if lease_end:
+                                try:
+                                    lease_end_dt = datetime.strptime(lease_end, "%Y-%m-%d")
+                                    
+                                    # Check if tenant moved out during the period
+                                    if date_start_dt <= lease_end_dt <= date_end_dt:
+                                        num_tenants_moved += 1
+                                        logger.info(f"Tenant moved: lease {lease.get('id')} ended on {lease_end}")
+                                    
+                                    # Check if lease overlaps with the period at any point
+                                    # A lease overlaps if: it starts before/during the period AND ends after/during the period
+                                    if lease_start_dt <= date_end_dt and lease_end_dt >= date_start_dt:
+                                        total_tenants += 1
+                                        logger.info(f"Lease active during period: {lease['start']} to {lease_end}")
+                                except (ValueError, TypeError):
+                                    logger.warning(f"Invalid date format in lease end: {lease_end}")
+                                    continue
+                            else:
+                                # Lease without end date - consider it active if it started before or during the period
+                                if lease_start_dt <= date_end_dt:
+                                    total_tenants += 1
+                                    logger.info(f"Lease without end date active: {lease['start']}")
 
 
                     except Exception as e:
-                        raise HTTPException(status_code=404, detail="no lease data for unit")   
+                        logger.warning(f"Error fetching lease data for unit {unit.get('id')}: {str(e)}")
+                        continue  # Continue to next unit instead of failing completely   
 
-                try:
-                    # Get total tenants who were active at the beginning of the period
-                    # This gives us tenants who were there at the start, not those who moved in during the period
-                    params = {
-                        'filter_property': property_id,
-                        'filter_start_date_to': date_from  # Only tenants who started before or on the start date
-                    }
+                # try:
+                #     # Get total tenants who were active at the beginning of the period
+                #     # This gives us tenants who were there at the start, not those who moved in during the period
+                #     params = {
+                #         'filter_property': property_id,
+                #         'filter_start_date_to': date_from  # Only tenants who started before or on the start date
+                #     }
 
-                    total_leases_resp = await client.get(f"{DOORLOOP_BASE_URL}/leases", headers=headers, params=params)
-                    total_leases_resp.raise_for_status()
-                    total_leases_data = total_leases_resp.json()
+                #     total_leases_resp = await client.get(f"{DOORLOOP_BASE_URL}/leases", headers=headers, params=params)
+                #     total_leases_resp.raise_for_status()
+                #     total_leases_data = total_leases_resp.json()
 
-                    num_tenants = total_leases_data.get('total', [])
+                #     num_tenants = total_leases_data.get('total', [])
 
 
-                except Exception as e:
-                    raise HTTPException(status_code=404, detail="no total leases for date range")  
+                # except Exception as e:
+                #     raise HTTPException(status_code=404, detail="no total leases for date range")  
                 
-
+                total_tenants
                 # Calculate tenant turnover rate
-                if num_tenants == 0:
+                if total_tenants == 0:
                     tenant_turnover_rate = 0
                 else:
-                    tenant_turnover_rate = (num_tenants_moved / num_tenants) * 100
+                    tenant_turnover_rate = (num_tenants_moved / total_tenants) * 100
 
-                logger.info(f"Tenants moved: {num_tenants_moved}, Total tenants: {num_tenants}, Turnover rate: {tenant_turnover_rate}%")
+                logger.info(f"Tenants moved: {num_tenants_moved}, Total tenants: {total_tenants}, Turnover rate: {tenant_turnover_rate}%")
 
                 return {
                     'number of tenants moved': num_tenants_moved,
-                    'number of tenants': num_tenants,
+                    'number of tenants': total_tenants,
                     'tenant turnover rate': tenant_turnover_rate
 
                 }
             
 
             except Exception as e:
-                raise HTTPException(status_code=404, detail="Unit data not found for property")
+                logger.error(f"Error fetching unit data for property {property_id}: {str(e)}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Error processing tenant turnover data: {str(e)}")
         
         else:
 
@@ -2916,60 +2975,336 @@ async def get_tenant_turnover(
 
                                 leases = lease_data.get('data', [])
                                 for lease in leases: 
-                                    if not lease.get('start') or not lease.get('end'):
+                                    if not lease.get('start'):
                                         continue
-                                        
+                                    
+                                    # Parse start date
                                     try:
                                         lease_start_dt = datetime.strptime(lease['start'], "%Y-%m-%d")
-                                        lease_end_dt = datetime.strptime(lease['end'], "%Y-%m-%d")
-                                    except (ValueError, TypeError):
-                                        logger.warning(f"Invalid date format in lease: {lease.get('start')}, {lease.get('end')}")
+                                    except (ValueError, TypeError, KeyError):
+                                        logger.warning(f"Invalid date format in lease start: {lease.get('start')}")
                                         continue
-
-                                    if date_start_dt < lease_end_dt < date_end_dt:
-                                        num_tenants_moved += 1
+                                    
+                                    # Handle leases with and without end dates
+                                    lease_end = lease.get('end')
+                                    if lease_end:
+                                        try:
+                                            lease_end_dt = datetime.strptime(lease_end, "%Y-%m-%d")
+                                            
+                                            # Check if tenant moved out during the period
+                                            if date_start_dt <= lease_end_dt <= date_end_dt:
+                                                num_tenants_moved += 1
+                                                logger.info(f"Tenant moved: lease {lease.get('id')} ended on {lease_end}")
+                                            
+                                            # Check if lease overlaps with the period at any point
+                                            # A lease overlaps if: it starts before/during the period AND ends after/during the period
+                                            if lease_start_dt <= date_end_dt and lease_end_dt >= date_start_dt:
+                                                total_tenants += 1
+                                                logger.info(f"Lease active during period: {lease['start']} to {lease_end}")
+                                        except (ValueError, TypeError):
+                                            logger.warning(f"Invalid date format in lease end: {lease_end}")
+                                            continue
+                                    else:
+                                        # Lease without end date - consider it active if it started before or during the period
+                                        if lease_start_dt <= date_end_dt:
+                                            total_tenants += 1
+                                            logger.info(f"Lease without end date active: {lease['start']}")
 
 
                             except Exception as e:
-                                raise HTTPException(status_code=404, detail="no lease data for unit")   
+                                logger.warning(f"Error fetching lease data for unit {unit.get('id')}: {str(e)}")
+                                continue  # Continue to next unit instead of failing completely
 
                     except Exception as e:
-                        raise HTTPException(status_code=404, detail="Unit data not found for property")
-
-                try:
-                    # Get total tenants who were active at the beginning of the period
-                    params = {
-                        'filter_start_date_to': date_from, # Only tenants who started before or on the start date
-                        'filter_end_date_from': date_to
-                    }
-
-                    total_leases_resp = await client.get(f"{DOORLOOP_BASE_URL}/leases", headers=headers, params=params)
-                    total_leases_resp.raise_for_status()
-                    total_leases_data = total_leases_resp.json()
-
-                    num_tenants = total_leases_data.get('total', [])
-
-
-                except Exception as e:
-                    raise HTTPException(status_code=404, detail="no total leases for date range")  
-                
+                        logger.warning(f"Error fetching unit data for property {property.get('id')}: {str(e)}")
+                        continue  # Continue to next property instead of failing completely
 
                 # Calculate tenant turnover rate
-                if num_tenants == 0:
+                if total_tenants == 0:
                     tenant_turnover_rate = 0
                 else:
-                    tenant_turnover_rate = (num_tenants_moved / num_tenants) * 100
+                    tenant_turnover_rate = (num_tenants_moved / total_tenants) * 100
 
-                logger.info(f"Tenants moved: {num_tenants_moved}, Total tenants: {num_tenants}, Turnover rate: {tenant_turnover_rate}%")
+                logger.info(f"Tenants moved: {num_tenants_moved}, Total tenants: {total_tenants}, Turnover rate: {tenant_turnover_rate}%")
 
                 return {
                     'number of tenants moved': num_tenants_moved,
-                    'number of tenants': num_tenants,
+                    'number of tenants': total_tenants,
                     'tenant turnover rate': tenant_turnover_rate
                 }
 
             except Exception as e:
-                raise HTTPException(status_code=404, detail="Property data not found")
+                logger.error(f"Error fetching property data: {str(e)}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Error processing tenant turnover data: {str(e)}")
+
+
+
+@router.get("/time_to_lease")
+async def get_time_to_lease(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    property_id: Optional[str] = None,
+):
+    """
+    Calculate Time to Lease (TTL) in days.
+    TTL = (Sum of (Lease Start Date - Vacancy Date)) / (Number of Leases Signed)
+    
+    For each lease that started in the date range, find when the unit became vacant
+    (end date of previous lease) and calculate the days between vacancy and lease start.
+    """
+    headers = get_doorloop_headers()
+
+    # Validate required parameters
+    if not date_from or not date_to:
+        raise HTTPException(status_code=400, detail="date_from and date_to are required")
+
+    # Parse the target date range
+    try:
+        date_start_dt = datetime.strptime(date_from, "%Y-%m-%d")
+        date_end_dt = datetime.strptime(date_to, "%Y-%m-%d")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid date format. Use YYYY-MM-DD: {str(e)}")
+
+    total_days_to_lease = 0
+    num_leases_signed = 0
+    skipped_leases = 0
+
+    async with httpx.AsyncClient() as client:
+        if property_id:
+            # Get units for the specific property
+            params = {
+                'filter_property': property_id
+            }
+
+            try:
+                unit_resp = await client.get(f"{DOORLOOP_BASE_URL}/units", headers=headers, params=params)
+                unit_resp.raise_for_status()
+                unit_data = unit_resp.json()
+                units = unit_data.get('data', [])
+                logger.info(f"Found {len(units)} units for property {property_id}")
+
+                for unit in units:
+                    if not unit.get('id'):
+                        continue
+
+                    try:
+                        # Get all leases for this unit
+                        params = {
+                            'filter_unit': unit['id']
+                        }
+                        lease_resp = await client.get(f"{DOORLOOP_BASE_URL}/leases", headers=headers, params=params)
+                        lease_resp.raise_for_status()
+                        lease_data = lease_resp.json()
+                        leases = lease_data.get('data', [])
+
+                        if not leases:
+                            continue
+
+                        # Sort leases by start date to find previous lease
+                        valid_leases = []
+                        for lease in leases:
+                            if not lease.get('start'):
+                                continue
+                            try:
+                                lease_start_dt = datetime.strptime(lease['start'], "%Y-%m-%d")
+                                lease_end_dt = None
+                                if lease.get('end'):
+                                    try:
+                                        lease_end_dt = datetime.strptime(lease['end'], "%Y-%m-%d")
+                                    except (ValueError, TypeError):
+                                        continue
+                                valid_leases.append({
+                                    'id': lease.get('id'),
+                                    'start': lease_start_dt,
+                                    'end': lease_end_dt
+                                })
+                            except (ValueError, TypeError, KeyError):
+                                continue
+
+                        # Sort by start date
+                        valid_leases.sort(key=lambda x: x['start'])
+
+                        # For each lease that overlaps with the date range, find vacancy date
+                        for i, lease in enumerate(valid_leases):
+                            # Check if lease overlaps with the date range
+                            # A lease overlaps if: it starts before/during the period AND (ends after/during the period OR has no end date)
+                            if lease['end']:
+                                # Fixed-term lease: overlaps if start <= period_end AND end >= period_start
+                                lease_overlaps = lease['start'] <= date_end_dt and lease['end'] >= date_start_dt
+                            else:
+                                # Lease with no end date (at-will): overlaps if it started before or during the period
+                                lease_overlaps = lease['start'] <= date_end_dt
+                            
+                            if not lease_overlaps:
+                                continue
+
+                            # Find vacancy date (end date of previous lease)
+                            vacancy_date = None
+                            if i > 0:
+                                # Previous lease exists - use its end date as vacancy date
+                                prev_lease = valid_leases[i - 1]
+                                if prev_lease['end']:
+                                    vacancy_date = prev_lease['end']
+                                else:
+                                    # Previous lease has no end date (at-will), skip this calculation
+                                    logger.info(f"Lease {lease['id']} started {lease['start'].strftime('%Y-%m-%d')} but previous lease has no end date, skipping")
+                                    skipped_leases += 1
+                                    continue
+                            else:
+                                # First lease for this unit - no previous vacancy to calculate
+                                logger.info(f"Lease {lease['id']} is the first lease for unit {unit['id']}, skipping (no previous vacancy)")
+                                skipped_leases += 1
+                                continue
+
+                            # Calculate days between vacancy and lease start
+                            if vacancy_date:
+                                days_to_lease = (lease['start'] - vacancy_date).days
+                                if days_to_lease < 0:
+                                    # Lease started before previous lease ended (overlap), skip
+                                    logger.warning(f"Lease {lease['id']} started before previous lease ended, skipping")
+                                    skipped_leases += 1
+                                    continue
+                                
+                                total_days_to_lease += days_to_lease
+                                num_leases_signed += 1
+                                logger.info(f"Lease {lease['id']}: Vacant {vacancy_date.strftime('%Y-%m-%d')} → Leased {lease['start'].strftime('%Y-%m-%d')} = {days_to_lease} days")
+
+                    except Exception as e:
+                        logger.warning(f"Error fetching lease data for unit {unit.get('id')}: {str(e)}")
+                        continue
+
+            except Exception as e:
+                logger.error(f"Error fetching unit data for property {property_id}: {str(e)}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Error processing time to lease data: {str(e)}")
+
+        else:
+            # Get all properties and process each
+            try:
+                property_resp = await client.get(f"{DOORLOOP_BASE_URL}/properties", headers=headers)
+                property_resp.raise_for_status()
+                property_data = property_resp.json()
+                properties = property_data.get('data', [])
+
+                for property in properties:
+                    if not property.get('id'):
+                        continue
+
+                    # Get units for this property
+                    params = {
+                        'filter_property': property['id']
+                    }
+
+                    try:
+                        unit_resp = await client.get(f"{DOORLOOP_BASE_URL}/units", headers=headers, params=params)
+                        unit_resp.raise_for_status()
+                        unit_data = unit_resp.json()
+                        units = unit_data.get('data', [])
+
+                        for unit in units:
+                            if not unit.get('id'):
+                                continue
+
+                            try:
+                                # Get all leases for this unit
+                                params = {
+                                    'filter_unit': unit['id']
+                                }
+                                lease_resp = await client.get(f"{DOORLOOP_BASE_URL}/leases", headers=headers, params=params)
+                                lease_resp.raise_for_status()
+                                lease_data = lease_resp.json()
+                                leases = lease_data.get('data', [])
+
+                                if not leases:
+                                    continue
+
+                                # Sort leases by start date
+                                valid_leases = []
+                                for lease in leases:
+                                    if not lease.get('start'):
+                                        continue
+                                    try:
+                                        lease_start_dt = datetime.strptime(lease['start'], "%Y-%m-%d")
+                                        lease_end_dt = None
+                                        if lease.get('end'):
+                                            try:
+                                                lease_end_dt = datetime.strptime(lease['end'], "%Y-%m-%d")
+                                            except (ValueError, TypeError):
+                                                continue
+                                        valid_leases.append({
+                                            'id': lease.get('id'),
+                                            'start': lease_start_dt,
+                                            'end': lease_end_dt
+                                        })
+                                    except (ValueError, TypeError, KeyError):
+                                        continue
+
+                                # Sort by start date
+                                valid_leases.sort(key=lambda x: x['start'])
+
+                                # For each lease that overlaps with the date range, find vacancy date
+                                for i, lease in enumerate(valid_leases):
+                                    # Check if lease overlaps with the date range
+                                    # A lease overlaps if: it starts before/during the period AND (ends after/during the period OR has no end date)
+                                    if lease['end']:
+                                        # Fixed-term lease: overlaps if start <= period_end AND end >= period_start
+                                        lease_overlaps = lease['start'] <= date_end_dt and lease['end'] >= date_start_dt
+                                    else:
+                                        # Lease with no end date (at-will): overlaps if it started before or during the period
+                                        lease_overlaps = lease['start'] <= date_end_dt
+                                    
+                                    if not lease_overlaps:
+                                        continue
+
+                                    # Find vacancy date (end date of previous lease)
+                                    vacancy_date = None
+                                    if i > 0:
+                                        prev_lease = valid_leases[i - 1]
+                                        if prev_lease['end']:
+                                            vacancy_date = prev_lease['end']
+                                        else:
+                                            skipped_leases += 1
+                                            continue
+                                    else:
+                                        skipped_leases += 1
+                                        continue
+
+                                    # Calculate days between vacancy and lease start
+                                    if vacancy_date:
+                                        days_to_lease = (lease['start'] - vacancy_date).days
+                                        if days_to_lease < 0:
+                                            skipped_leases += 1
+                                            continue
+                                        
+                                        total_days_to_lease += days_to_lease
+                                        num_leases_signed += 1
+
+                            except Exception as e:
+                                logger.warning(f"Error fetching lease data for unit {unit.get('id')}: {str(e)}")
+                                continue
+
+                    except Exception as e:
+                        logger.warning(f"Error fetching unit data for property {property.get('id')}: {str(e)}")
+                        continue
+
+            except Exception as e:
+                logger.error(f"Error fetching property data: {str(e)}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Error processing time to lease data: {str(e)}")
+
+    # Calculate average time to lease
+    if num_leases_signed == 0:
+        time_to_lease = 0
+    else:
+        time_to_lease = round(total_days_to_lease / num_leases_signed, 1)
+
+    logger.info(f"Time to Lease calculation: Total days={total_days_to_lease}, Leases signed={num_leases_signed}, TTL={time_to_lease} days, Skipped={skipped_leases}")
+
+    return {
+        'time_to_lease_days': time_to_lease,
+        'total_days_to_lease': total_days_to_lease,
+        'number_of_leases_signed': num_leases_signed,
+        'skipped_leases': skipped_leases
+    }
+
 
 
 # @router.get('/balance_overdue')
@@ -3176,12 +3511,15 @@ async def get_rent_roll(
                 data = resp.json()
 
                 rent_roll = data.get('data', [])
-                logger.info(f"rent roll length: {int(len(rent_roll))}")    
+                logger.info(f"rent roll length: {int(len(rent_roll))}")
+                
+                # Log available fields from first lease for debugging
+                if rent_roll and len(rent_roll) > 0:
+                    first_lease = rent_roll[0]
+                    logger.info(f"Sample lease fields: {list(first_lease.keys())}")
+                    logger.info(f"Sample lease balance fields - totalBalanceDue: {first_lease.get('totalBalanceDue')}, totalBalanceOverdue: {first_lease.get('totalBalanceOverdue')}, balanceOverdue: {first_lease.get('balanceOverdue')}")    
 
                 for lease in rent_roll:
-                    if not lease.get('totalBalanceDue'):
-                        continue
-                    
                     # Filter by property - the API is returning data for all properties
                     if lease.get('property') != property_id:
                         logger.info(f"Skipping lease from different property: {lease.get('property')} (requested: {property_id})")
@@ -3199,12 +3537,22 @@ async def get_rent_roll(
                         logger.warning(f"Invalid date format in lease: {lease.get('start')}, {lease.get('end')}")
                         continue
 
-
                     if ((lease_start <= date_start_dt and date_end_dt <= lease_end) or (date_start_dt <= lease_start <= date_end_dt)
                         or (date_start_dt <= lease_end <= date_end_dt) or (lease_start <= date_start_dt and lease_end >= date_end_dt)):
 
-                        logger.info(f"lease start: {lease['start']}, lease end: {lease['end']}, balance: {lease['totalBalanceDue']}")
-                        totalBalance += lease['totalBalanceDue']
+                        # Use totalBalanceOverdue if available, otherwise fall back to totalBalanceDue
+                        # Check for various possible field names for overdue balance
+                        overdue_balance = (
+                            lease.get('totalBalanceOverdue') or 
+                            lease.get('balanceOverdue') or 
+                            lease.get('pastDueBalance') or 
+                            lease.get('overdueBalance') or
+                            lease.get('totalBalanceDue')  # Fallback to total balance due if no overdue field
+                        )
+                        
+                        if overdue_balance and overdue_balance > 0:
+                            logger.info(f"lease start: {lease['start']}, lease end: {lease['end']}, overdue balance: {overdue_balance}, total balance due: {lease.get('totalBalanceDue', 0)}")
+                            totalBalance += overdue_balance
 
                 return {'totalBalance': totalBalance}
 
@@ -3238,9 +3586,6 @@ async def get_rent_roll(
                         logger.info(f"Property {property['id']} rent roll length: {int(len(rent_roll))}")    
 
                         for lease in rent_roll:
-                            if not lease.get('totalBalanceDue'):
-                                continue
-
                             # Filter by property - the API is returning data for all properties
                             if lease.get('property') != property['id']:
                                 logger.info(f"Skipping lease from different property: {lease.get('property')} (requested: {property['id']})")
@@ -3258,12 +3603,22 @@ async def get_rent_roll(
                                 logger.warning(f"Invalid date format in lease: {lease.get('start')}, {lease.get('end')}")
                                 continue
 
-
                             if ((lease_start <= date_start_dt and date_end_dt <= lease_end) or (date_start_dt <= lease_start <= date_end_dt)
                                 or (date_start_dt <= lease_end <= date_end_dt) or (lease_start <= date_start_dt and lease_end >= date_end_dt)):
 
-                                logger.info(f"lease start: {lease['start']}, lease end: {lease['end']}, balance: {lease['totalBalanceDue']}")
-                                totalBalance += lease['totalBalanceDue']
+                                # Use totalBalanceOverdue if available, otherwise fall back to totalBalanceDue
+                                # Check for various possible field names for overdue balance
+                                overdue_balance = (
+                                    lease.get('totalBalanceOverdue') or 
+                                    lease.get('balanceOverdue') or 
+                                    lease.get('pastDueBalance') or 
+                                    lease.get('overdueBalance') or
+                                    lease.get('totalBalanceDue')  # Fallback to total balance due if no overdue field
+                                )
+                                
+                                if overdue_balance and overdue_balance > 0:
+                                    logger.info(f"lease start: {lease['start']}, lease end: {lease['end']}, overdue balance: {overdue_balance}, total balance due: {lease.get('totalBalanceDue', 0)}")
+                                    totalBalance += overdue_balance
 
                     except Exception as e:
                         logger.error(f"Error processing rent roll data for property {property['id']}: {e}")
