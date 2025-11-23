@@ -54,12 +54,16 @@ async def get_short_term_kpis(
             resp = await client.get(f"{JURNY_URL}/integration/stats", headers=headers, params=params)
             resp.raise_for_status()
             data = resp.json()
+
             data_current_period = data.get('currentPeriod', {})
             data_total = data_current_period.get('total', {})
-            revenue = data_total.get('revenues', 0)
+            revenue = data_total.get('income', 0)
             occupancy = data_total.get('occupancy', 0)
             adr = data_total.get('adr', 0)
             revpar = data_total.get('revpar', 0)
+
+
+
             
             return {
                 "revenue": revenue,
