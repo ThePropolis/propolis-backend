@@ -32,6 +32,14 @@ app = FastAPI(
 @app.middleware("http")
 async def log_request_scheme(request: Request, call_next):
     print(f"🔍 SCHEME: {request.url.scheme} — FULL URL: {request.url}")
+    # Handle OPTIONS preflight requests explicitly
+    if request.method == "OPTIONS":
+        response = await call_next(request)
+        response.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        return response
     response = await call_next(request)
     return response
 
@@ -39,9 +47,11 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://localhost:5174","https://propolis-frontend.vercel.app", "https://propolis-dashboard.com"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
+
 
 app.include_router(auth_router)
 app.include_router(doorloop_router)
