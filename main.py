@@ -45,7 +45,7 @@ async def log_request_scheme(request: Request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:5174","https://propolis-frontend.vercel.app", "https://propolis-dashboard.com"],
+    allow_origins=["http://localhost:5173", "http://localhost:5174","https://propolis-frontend-new.vercel.app", "https://propolis-dashboard.com"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
