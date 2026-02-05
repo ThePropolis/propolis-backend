@@ -7,7 +7,7 @@ from fastapi import FastAPI, Depends, HTTPException, Request
 import httpx
 import os
 from dotenv import load_dotenv
-
+from longterm_unittype_filter import router as longterm_unittype_filter_router
 from auth import router as auth_router
 from doorloop import router as doorloop_router
 from jurny import router as jurny_router
@@ -56,6 +56,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(doorloop_router)
 app.include_router(jurny_router)
+app.include_router(longterm_unittype_filter_router)
 
 
 
