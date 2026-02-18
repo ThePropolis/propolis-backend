@@ -177,8 +177,8 @@ def calculate_financials(records: list) -> dict:
 async def longterm_unittype_filter(
     date_from: str,                     # e.g., "2025-06-01" (required)
     date_to: str,                       # e.g., "2025-12-31" (required)
-    property_id: str,                   # e.g., "Aerie" (required)
     unit_type: str,                     # e.g., "3/3" (required)
+    property_id: Optional[str] = None,  # e.g., "Aerie" (optional - if not provided, queries all properties)
     length: str = "Long",               # "Long" or "Short"
     unit: Optional[str] = None          # e.g., "21A" (optional)
 ):
@@ -188,8 +188,9 @@ async def longterm_unittype_filter(
     
     - date_from: Start date (YYYY-MM-DD)
     - date_to: End date (YYYY-MM-DD)
-    - property_id: Property name without "Apartments" suffix (e.g., "Aerie")
     - unit_type: Unit type like "3/3", "2/2", "3/2"
+    - property_id: Optional property name without "Apartments" suffix (e.g., "Aerie")
+                   If not provided, queries all properties
     - length: "Long" or "Short" term
     - unit: Optional specific unit (e.g., "21A")
     """
@@ -199,32 +200,40 @@ async def longterm_unittype_filter(
         
         all_data = []
         
+        # List of all property names (without "Apartments" suffix)
+        # These correspond to the property metadata tables in the Properties schema
+        ALL_PROPERTIES = ["Aerie", "Otto", "Pastel", "Plum", "Saffron"]
+        
+        # If property_id is provided, only query that property; otherwise query all
+        properties_to_query = [property_id] if property_id else ALL_PROPERTIES
+        
         # Query each month's table and combine results
         for month in months:
-            try:
-                logger.info(f"Calling RPC for month={month}, property={property_id}, unit_type={unit_type}, length={length}, unit={unit}")
-                
-                response = supabase.rpc("get_filtered_leases", {
-                    "p_date": month,
-                    "p_property": property_id,
-                    "p_unit_type": unit_type,
-                    "p_length": length,
-                    "p_unit": unit
-                }).execute()
-                
-                logger.info(f"RPC response for {month}: data={response.data}, count={len(response.data) if response.data else 0}")
-                
-                if response.data:
-                    # Add month info to each record for context
-                    for record in response.data:
-                        record["month"] = month
-                    all_data.extend(response.data)
+            for prop in properties_to_query:
+                try:
+                    logger.info(f"Calling RPC for month={month}, property={prop}, unit_type={unit_type}, length={length}, unit={unit}")
                     
-            except Exception as e:
-                # Log but continue if a specific month table doesn't exist
-                logger.error(f"Error querying table for {month}: {str(e)}")
-                print(f"Warning: Could not query table for {month}: {str(e)}")
-                continue
+                    response = supabase.rpc("get_filtered_leases", {
+                        "p_date": month,
+                        "p_property": prop,
+                        "p_unit_type": unit_type,
+                        "p_length": length,
+                        "p_unit": unit
+                    }).execute()
+                    
+                    logger.info(f"RPC response for {month}/{prop}: data count={len(response.data) if response.data else 0}")
+                    
+                    if response.data:
+                        # Add month and property info to each record for context
+                        for record in response.data:
+                            record["month"] = month
+                            record["property"] = prop
+                        all_data.extend(response.data)
+                        
+                except Exception as e:
+                    # Log but continue if a specific month/property table doesn't exist
+                    logger.error(f"Error querying table for {month}/{prop}: {str(e)}")
+                    continue
         
         # Calculate occupancy metrics
         occupancy = calculate_occupancy(all_data, date_from, date_to)
@@ -243,5 +252,52 @@ async def longterm_unittype_filter(
         
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/units")
+async def get_units_for_filter(
+    unit_type: str,                     # e.g., "3/3" (required)
+    property_id: Optional[str] = None,  # e.g., "Aerie" (optional)
+    length: str = "Long"                # "Long" or "Short"
+):
+    """
+    Get available units for a given unit type and optionally a property.
+    Used to populate the units dropdown in the UI.
+    
+    - unit_type: Unit type like "3/3", "2/2", "3/2"
+    - property_id: Optional property name (e.g., "Aerie")
+    - length: "Long" or "Short" term
+    """
+    try:
+        ALL_PROPERTIES = ["Aerie", "Otto", "Pastel", "Plum", "Saffron"]
+        properties_to_query = [property_id] if property_id else ALL_PROPERTIES
+        
+        all_units = []
+        
+        for prop in properties_to_query:
+            try:
+                response = supabase.rpc("get_units_by_type", {
+                    "p_property": prop,
+                    "p_unit_type": unit_type,
+                    "p_length": length
+                }).execute()
+                
+                if response.data:
+                    for unit_record in response.data:
+                        unit_record["property"] = prop
+                    all_units.extend(response.data)
+                    
+            except Exception as e:
+                logger.error(f"Error querying units for {prop}: {str(e)}")
+                continue
+        
+        return {
+            "success": True,
+            "units": all_units,
+            "count": len(all_units)
+        }
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
