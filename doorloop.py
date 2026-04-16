@@ -6,12 +6,19 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends
 import httpx
 import os
+import time
 from dotenv import load_dotenv
+
+from auth import require_role
 
 load_dotenv()
 
 logger = logging.getLogger("doorloop")
 router = APIRouter(prefix="/api/doorloop", tags=["doorloop"])
+
+# In-memory cache for the facilities endpoint (rarely changes)
+_FACILITIES_CACHE: dict = {"expires_at": 0.0, "data": None}
+_FACILITIES_TTL_SECONDS = 300
 
 DOORLOOP_API_KEY = os.getenv("DOORLOOP_API_KEY")
 if not DOORLOOP_API_KEY:
@@ -32,9 +39,9 @@ async def get_doorloop_properties():
     """Get all properties from Doorloop API."""
     properties_url = f"{DOORLOOP_BASE_URL}/properties"
     headers = get_doorloop_headers()
-    
+
     logger.info(f"Making request to: {properties_url}")
-    
+
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(properties_url, headers=headers)
@@ -44,6 +51,10 @@ async def get_doorloop_properties():
             return data
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP Error {e.response.status_code}: {e.response.text}")
+            # Handle rate limiting (429) gracefully - return empty data instead of failing
+            if e.response.status_code == 429:
+                logger.warning("Doorloop API rate limited (429), returning empty data")
+                return {"data": [], "total": 0, "rate_limited": True}
             raise HTTPException(status_code=502, detail=f"Failed to fetch properties from Doorloop: {e.response.status_code}") from e
         except Exception as e:
             logger.error(f"Unexpected error fetching properties: {e}")
@@ -74,6 +85,79 @@ async def get_doorloop_property(property_id: str):
         except Exception as e:
             logger.error(f"Unexpected error fetching property {clean_property_id}: {e}")
             raise HTTPException(status_code=500, detail="Internal server error") from e
+
+@router.get("/facilities")
+async def get_facilities(_: dict = Depends(require_role("owner", "operator"))):
+    """
+    Flat list of units with their amenities, grouped by property.
+    Used by the operator 'Facilities' page. Results are cached for 5 minutes
+    because amenities rarely change and DoorLoop's rate limit is tight.
+    """
+    now = time.time()
+    if _FACILITIES_CACHE["data"] is not None and _FACILITIES_CACHE["expires_at"] > now:
+        return _FACILITIES_CACHE["data"]
+
+    headers = get_doorloop_headers()
+    properties_out: list = []
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        # 1. Fetch all properties
+        try:
+            props_resp = await client.get(f"{DOORLOOP_BASE_URL}/properties", headers=headers, params={"limit": 100})
+            props_resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=502, detail=f"DoorLoop properties fetch failed: {e.response.status_code}") from e
+
+        properties = props_resp.json().get("data", [])
+
+        # 2. For each property, fetch units with amenities
+        for prop in properties:
+            prop_id = prop.get("id")
+            prop_name = prop.get("name", "Unknown")
+            if not prop_id:
+                continue
+
+            try:
+                units_resp = await client.get(
+                    f"{DOORLOOP_BASE_URL}/units",
+                    headers=headers,
+                    params={"filter_property": prop_id, "limit": 200},
+                )
+                units_resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                logger.warning(f"Skipping property {prop_name}: units fetch HTTP {e.response.status_code}")
+                continue
+
+            units = units_resp.json().get("data", [])
+            units_out = [
+                {
+                    "unit_id": u.get("id"),
+                    "unit_name": u.get("name", ""),
+                    "beds": u.get("beds"),
+                    "baths": u.get("baths"),
+                    "amenities": u.get("amenities", []) or [],
+                }
+                for u in units
+                if u.get("active", True)
+            ]
+
+            properties_out.append({
+                "property_id": prop_id,
+                "property_name": prop_name,
+                "property_amenities": prop.get("amenities", []) or [],
+                "units": units_out,
+            })
+
+    # Collect the unique set of amenity names for the frontend filter dropdown
+    all_amenities = sorted({
+        a for p in properties_out for u in p["units"] for a in u["amenities"]
+    })
+
+    payload = {"properties": properties_out, "all_amenities": all_amenities}
+    _FACILITIES_CACHE["data"] = payload
+    _FACILITIES_CACHE["expires_at"] = now + _FACILITIES_TTL_SECONDS
+    return payload
+
 
 @router.get("/test")
 async def test_doorloop_connection():
@@ -1008,25 +1092,31 @@ async def get_occupancy_rate(
             logger.info(f"Property {property_id}: {units_by_property_response} total units")
 
             total_units = units_by_property_response.get("numOfUnits", 0)
-            
-            # Get occupied units for the specific property
-            occupied_units = await get_occupancy(date_from, date_to, property_id)
-            logger.info(f"Property {property_id}: {occupied_units} occupied units")
-            
-            # Calculate occupancy rate
+
+            occ = await get_occupancy(date_from, date_to, property_id)
+            binary_sum = occ["binary"]
+            prorated_sum = occ["prorated"]
+
             if total_units == 0:
-                occupancy_rate_percentage_for_property = 0
+                rate_binary = 0.0
+                rate_prorated = 0.0
             else:
-                # Final occupancy rate = total occupancy percentage / total units
-                occupancy_rate_percentage_for_property = occupied_units / total_units
+                rate_binary = binary_sum / total_units
+                rate_prorated = prorated_sum / total_units
 
             return {
-                "occupancy_rate": round(occupancy_rate_percentage_for_property, 2),
-                "occupied_units": occupied_units,
+                # primary (binary) — kept as top-level for backwards compatibility
+                "occupancy_rate": round(rate_binary, 2),
+                "occupied_units": binary_sum,
                 "total_units": total_units,
                 "date_from": date_from,
                 "date_to": date_to,
-                "percentage": f"{round(occupancy_rate_percentage_for_property, 2)}%"
+                "percentage": f"{round(rate_binary, 2)}%",
+                # both methods exposed explicitly
+                "occupancy_rate_binary": round(rate_binary, 2),
+                "occupancy_rate_prorated": round(rate_prorated, 2),
+                "occupied_units_binary": binary_sum,
+                "occupied_units_prorated": round(prorated_sum, 2),
             }
             # return {
             #     "occupied_units": len(unitsDict),
@@ -1062,29 +1152,33 @@ async def get_occupancy_rate(
                 total_units = 50
                 logger.warning(f"Using fallback total_units: {total_units}")
             
-            # Get occupied units from active leases
-            occupied_units = await get_occupancy(date_from, date_to)
-            logger.info(f"Found {occupied_units} occupied units")
-            
-            # Calculate occupancy rate
+            occ = await get_occupancy(date_from, date_to)
+            binary_sum = occ["binary"]
+            prorated_sum = occ["prorated"]
+
             if total_units == 0:
-                occupancy_rate = 0
+                rate_binary = 0.0
+                rate_prorated = 0.0
             else:
-                occupancy_rate = (occupied_units / total_units)
-            
-            logger.info(f"=== DOORLOOP OCCUPANCY CALCULATION RESULT ===")
+                rate_binary = binary_sum / total_units
+                rate_prorated = prorated_sum / total_units
+
+            logger.info(f"=== DOORLOOP OCCUPANCY RESULT ===")
             logger.info(f"Total units: {total_units}")
-            logger.info(f"Occupied units: {occupied_units}")
-            logger.info(f"Occupancy rate: {occupancy_rate:.2f}%")
-            logger.info(f"=== END DOORLOOP CALCULATION ===")
-            
+            logger.info(f"Binary:   rate={rate_binary:.2f}% (sum={binary_sum})")
+            logger.info(f"Prorated: rate={rate_prorated:.2f}% (sum={prorated_sum:.2f})")
+
             return {
-                "occupancy_rate": round(occupancy_rate, 2),
-                "occupied_units": occupied_units,
+                "occupancy_rate": round(rate_binary, 2),
+                "occupied_units": binary_sum,
                 "total_units": total_units,
                 "date_from": date_from,
                 "date_to": date_to,
-                "percentage": f"{round(occupancy_rate, 2)}%"
+                "percentage": f"{round(rate_binary, 2)}%",
+                "occupancy_rate_binary": round(rate_binary, 2),
+                "occupancy_rate_prorated": round(rate_prorated, 2),
+                "occupied_units_binary": binary_sum,
+                "occupied_units_prorated": round(prorated_sum, 2),
             }
             
         except Exception as e:
@@ -2294,6 +2388,15 @@ async def get_units(
                         "message": "Units endpoint not found",
                         "suggestion": "The /units endpoint may not be available in your Doorloop plan"
                     }
+                elif e.response.status_code == 429:
+                    # Handle rate limiting gracefully
+                    logger.warning("Doorloop API rate limited (429), returning empty data")
+                    return {
+                        "success": True,
+                        "data": [],
+                        "rate_limited": True,
+                        "message": "Rate limited by Doorloop API"
+                    }
                 else:
                     return {
                         "success": False,
@@ -2405,12 +2508,16 @@ async def get_occupancy(
     ):
 
     overlapped_leases = []
-    unit_occupancy = {}  # Track occupancy percentage per unit
-    
+    # Two tracking dicts so we can return both calculation methods in one pass.
+    # binary: any overlap with the period = 100%
+    # prorated: percentage of days in the period that the lease covered
+    unit_occupancy_binary: dict = {}
+    unit_occupancy_prorated: dict = {}
+
     # Parse the target date range
     date_start_dt = datetime.strptime(date_start, "%Y-%m-%d")
     date_end_dt = datetime.strptime(date_end, "%Y-%m-%d")
-    
+
     # Calculate total days in the requested period
     total_days = (date_end_dt - date_start_dt).days + 1  # +1 to include both dates
     
@@ -2509,46 +2616,44 @@ async def get_occupancy(
                             lease_start_dt = datetime.strptime(lease_start_str, "%Y-%m-%d")
                             
                             # Get unit ID for this lease
-                            unit_id = lease.get('unit', {}).get('id') if isinstance(lease.get('unit'), dict) else lease.get('unit')
+                            # DoorLoop API returns unit IDs in 'units' array, not 'unit'
+                            units_list = lease.get('units', [])
+                            unit_id = units_list[0] if units_list else None
                             if not unit_id:
                                 unit_id = lease.get('id', 'unknown')  # Fallback to lease ID
                             
                             # Handle at-will leases (no end date, "AtWill", or "N/A")
                             if not lease_end_str or lease_end_str == 'AtWill' or lease_end_str == 'N/A':
-                                # At-will lease - overlaps if started before or during the period
+                                # At-will: assume covers the rest of the period from lease_start onwards
                                 if lease_start_dt <= date_end_dt:
-                                    # Track occupancy for this unit (binary: occupied or not)
-                                    unit_occupancy[unit_id] = 100  # At-will lease = 100% occupied
+                                    unit_occupancy_binary[unit_id] = 100
+                                    # Prorated: count days from max(start, lease_start) to date_end
+                                    effective_start = max(lease_start_dt, date_start_dt)
+                                    days = (date_end_dt - effective_start).days + 1
+                                    pct = max(0.0, min(100.0, days / total_days * 100))
+                                    unit_occupancy_prorated[unit_id] = max(
+                                        pct, unit_occupancy_prorated.get(unit_id, 0)
+                                    )
                                     overlapped_leases.append(lease)
                                     logger.info(f"✅ At-will lease {lease.get('id', 'no-id')} overlaps: {lease_start_str} (no end date)")
                                 else:
-                                    logger.debug(f"❌ At-will lease {lease.get('id', 'no-id')} doesn't overlap: {lease_start_str} (no end date)")
+                                    logger.debug(f"❌ At-will lease {lease.get('id', 'no-id')} doesn't overlap: {lease_start_str}")
                             else:
-                                # Fixed-term lease - parse end date and check overlap
                                 lease_end_dt = datetime.strptime(lease_end_str, "%Y-%m-%d")
-                                
-                                # Check if lease overlaps with the date range using the existing function
-                                # if lease_overlaps_date_range(lease_start_dt, lease_end_dt, date_start_dt, date_end_dt):
-                                if lease_start_dt <= date_start_dt and date_end_dt <= lease_end_dt:
-                                    # Track occupancy for this unit (binary: occupied or not)
-                                    unit_occupancy[unit_id] = 100  # Fixed-term lease = 100% occupied
+
+                                if lease_start_dt <= date_end_dt and lease_end_dt >= date_start_dt:
+                                    # Binary: any overlap = 100%
+                                    unit_occupancy_binary[unit_id] = 100
+                                    # Prorated: days of overlap / days in period
+                                    overlap_start = max(lease_start_dt, date_start_dt)
+                                    overlap_end = min(lease_end_dt, date_end_dt)
+                                    days = (overlap_end - overlap_start).days + 1
+                                    pct = max(0.0, min(100.0, days / total_days * 100))
+                                    unit_occupancy_prorated[unit_id] = max(
+                                        pct, unit_occupancy_prorated.get(unit_id, 0)
+                                    )
                                     overlapped_leases.append(lease)
                                     logger.info(f"✅ Fixed-term lease {lease.get('id', 'no-id')} overlaps: {lease_start_str} to {lease_end_str}")
-                                elif date_start_dt < lease_start_dt and date_end_dt < lease_end_dt:
-                                    days = (date_end_dt - date_start_dt).days - (lease_start_dt - date_start_dt).days + 1
-                                    unit_occupancy[unit_id] = max(days / total_days * 100, unit_occupancy.get(unit_id, 0))
-                                    overlapped_leases.append(lease)
-                                    logger.info(f"✅ Fixed-term lease {lease.get('id', 'no-id')} overlaps: {lease_start_str} to {lease_end_str} - {days / total_days * 100:.1f}% occupancy")
-                                elif date_start_dt < lease_start_dt and date_end_dt > lease_end_dt:
-                                    days = (lease_end_dt - lease_start_dt).days + 1
-                                    unit_occupancy[unit_id] = max(days / total_days * 100, unit_occupancy.get(unit_id, 0))
-                                    overlapped_leases.append(lease)
-                                    logger.info(f"✅ Fixed-term lease {lease.get('id', 'no-id')} overlaps: {lease_start_str} to {lease_end_str} - {days / total_days * 100:.1f}% occupancy")
-                                elif lease_start_dt < date_start_dt and lease_end_dt < date_end_dt:
-                                    days = (lease_end_dt - date_start_dt).days + 1
-                                    unit_occupancy[unit_id] = max(days / total_days * 100, unit_occupancy.get(unit_id, 0))
-                                    overlapped_leases.append(lease)
-                                    logger.info(f"✅ Fixed-term lease {lease.get('id', 'no-id')} overlaps: {lease_start_str} to {lease_end_str} - {days / total_days * 100:.1f}% occupancy")
                                 else:
                                     logger.debug(f"❌ Fixed-term lease {lease.get('id', 'no-id')} doesn't overlap: {lease_start_str} to {lease_end_str}")
                                 
@@ -2571,15 +2676,13 @@ async def get_occupancy(
         except Exception as e:
             logger.error(f"Error in get_occupancy: {e}")
 
-    # Return count of occupied units (not percentage)
-    occupied_units_count = len(unit_occupancy)
-    
-    logger.info(f"{len(overlapped_leases)} leases that overlap with {date_start} to {date_end}")
-    logger.info(f"Occupied units: {occupied_units_count}")
-    logger.info(f"Unit occupancy details: {unit_occupancy}")
-    occupancy = sum(unit_occupancy.values())
-    logger.info(f"Occupancy: {occupancy}")
-    return occupancy
+    binary_sum = sum(unit_occupancy_binary.values())
+    prorated_sum = sum(unit_occupancy_prorated.values())
+    logger.info(
+        f"{len(overlapped_leases)} leases overlap {date_start}..{date_end} | "
+        f"binary sum={binary_sum} | prorated sum={prorated_sum:.2f}"
+    )
+    return {"binary": binary_sum, "prorated": prorated_sum}
         
 
 @router.get("/avg_lease_tenancy")
