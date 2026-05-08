@@ -14,6 +14,9 @@ from auth import router as auth_router, require_role, get_current_user_payload
 from properties import router as properties_router
 from admin import router as admin_router
 from facilities import router as facilities_router
+from inventory import router as inventory_router
+from portfolio import router as portfolio_router
+from listings import router as listings_router
 
 # Optional integrations - won't fail if API keys are missing
 doorloop_router = None
@@ -78,6 +81,9 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(facilities_router)
+app.include_router(inventory_router)
+app.include_router(portfolio_router)
+app.include_router(listings_router)
 
 # Data-source routers were public before this refactor and many frontend
 # callsites don't yet send Authorization headers. Keep them open at the router
