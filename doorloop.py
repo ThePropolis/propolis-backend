@@ -10,6 +10,7 @@ import time
 from dotenv import load_dotenv
 
 from auth import require_role
+from database import supabase
 
 load_dotenv()
 
@@ -1135,22 +1136,23 @@ async def get_occupancy_rate(
         logger.info(f"Calculating overall occupancy rate from {date_from} to {date_to}")
         
         try:
-            # Get total units from all properties
             logger.info(f"=== DOORLOOP OCCUPANCY CALCULATION START ===")
             logger.info(f"Date range: {date_from} to {date_to}")
+            # Use LTR room count from prop_rooms as the denominator.
+            # DoorLoop's get_total_units() includes STR units which have no leases,
+            # artificially deflating LTR occupancy. prop_rooms WHERE length='LTR' is
+            # the authoritative count of long-term rentable rooms.
             try:
-                logger.info(f"Calling get_total_units function...")
-                total_units = await get_total_units(headers)
-                logger.info(f"✅ get_total_units completed successfully: {total_units} total units")
-                logger.info(f"Type of total_units: {type(total_units)}")
+                ltr_res = supabase.table("prop_rooms").select("id", count="exact").eq("length", "LTR").execute()
+                total_units = ltr_res.count or 0
+                logger.info(f"✅ LTR room count from prop_rooms: {total_units}")
             except Exception as e:
-                logger.error(f"❌ get_total_units failed with error: {str(e)}")
-                logger.error(f"Error type: {type(e)}")
-                import traceback
-                logger.error(f"Full traceback: {traceback.format_exc()}")
-                # Fallback to a default value
-                total_units = 50
-                logger.warning(f"Using fallback total_units: {total_units}")
+                logger.error(f"❌ LTR room count failed: {e}. Falling back to DoorLoop unit count.")
+                try:
+                    total_units = await get_total_units(headers)
+                except Exception:
+                    total_units = 116  # last known LTR room count
+                logger.warning(f"Fallback total_units: {total_units}")
             
             occ = await get_occupancy(date_from, date_to)
             binary_sum = occ["binary"]
