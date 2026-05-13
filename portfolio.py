@@ -65,6 +65,7 @@ class BuildingUpdate(BuildingBase):
 class UnitBase(BaseModel):
     name: Optional[str] = None
     unit_type: Optional[str] = None
+    amenity_ids: Optional[List[str]] = None
     notes: Optional[str] = None
 
 
@@ -83,6 +84,8 @@ class RoomBase(BaseModel):
     name: Optional[str] = None
     length: Optional[Length] = None
     strategy: Optional[Strategy] = None
+    beds: Optional[int] = None
+    baths: Optional[int] = None
     bed_size: Optional[str] = None
     bathroom: Optional[str] = None
     ceiling_height: Optional[str] = None
@@ -139,7 +142,7 @@ class MonthlyPerfUpdate(BaseModel):
 
 
 STRUCTURAL_ROOM_FIELDS = {
-    "name", "length", "strategy", "bed_size", "bathroom", "ceiling_height",
+    "name", "length", "strategy", "beds", "baths", "bed_size", "bathroom", "ceiling_height",
     "balcony", "room_type_name", "sqft", "is_ada", "listing_date", "amenity_ids", "notes",
 }
 FINANCIAL_ROOM_FIELDS = {
@@ -218,7 +221,7 @@ async def list_amenities(_: dict = Depends(require_role("owner", "investor", "op
 
 
 @router.post("/amenities")
-async def create_amenity(body: AmenityCreate, _: dict = Depends(require_role("owner"))):
+async def create_amenity(body: AmenityCreate, _: dict = Depends(require_role("owner", "operator"))):
     if not body.name.strip():
         raise HTTPException(status_code=400, detail="Name required")
     payload = {"name": body.name.strip(), "category": body.category}
@@ -245,7 +248,7 @@ async def create_amenity(body: AmenityCreate, _: dict = Depends(require_role("ow
 async def update_amenity(
     amenity_id: str,
     body: AmenityUpdate,
-    _: dict = Depends(require_role("owner")),
+    _: dict = Depends(require_role("owner", "operator")),
 ):
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     if not updates:
@@ -259,14 +262,14 @@ async def update_amenity(
 
 
 @router.delete("/amenities/{amenity_id}")
-async def delete_amenity(amenity_id: str, _: dict = Depends(require_role("owner"))):
+async def delete_amenity(amenity_id: str, _: dict = Depends(require_role("owner", "operator"))):
     supabase.table("prop_amenities").delete().eq("id", amenity_id).execute()
     return {"id": amenity_id, "deleted": True}
 
 
 # ── Buildings ─────────────────────────────────────────────────────────────
 @router.post("/buildings")
-async def create_building(body: BuildingCreate, _: dict = Depends(require_role("owner"))):
+async def create_building(body: BuildingCreate, _: dict = Depends(require_role("owner", "operator"))):
     if not body.name or not body.name.strip():
         raise HTTPException(status_code=400, detail="Name is required")
     payload = {k: v for k, v in body.model_dump().items() if v is not None}
@@ -281,7 +284,7 @@ async def create_building(body: BuildingCreate, _: dict = Depends(require_role("
 async def update_building(
     building_id: str,
     body: BuildingUpdate,
-    _: dict = Depends(require_role("owner")),
+    _: dict = Depends(require_role("owner", "operator")),
 ):
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     if not updates:
@@ -295,14 +298,14 @@ async def update_building(
 
 
 @router.delete("/buildings/{building_id}")
-async def delete_building(building_id: str, _: dict = Depends(require_role("owner"))):
+async def delete_building(building_id: str, _: dict = Depends(require_role("owner", "operator"))):
     supabase.table("prop_buildings").delete().eq("id", building_id).execute()
     return {"id": building_id, "deleted": True}
 
 
 # ── Units ─────────────────────────────────────────────────────────────────
 @router.post("/units")
-async def create_unit(body: UnitCreate, _: dict = Depends(require_role("owner"))):
+async def create_unit(body: UnitCreate, _: dict = Depends(require_role("owner", "operator"))):
     b = (
         supabase.table("prop_buildings")
         .select("id")
@@ -316,6 +319,7 @@ async def create_unit(body: UnitCreate, _: dict = Depends(require_role("owner"))
         "building_id": body.building_id,
         "name": body.name.strip(),
         "unit_type": body.unit_type,
+        "amenity_ids": body.amenity_ids or [],
         "notes": body.notes,
     }
     resp = supabase.table("prop_units").insert(payload).execute()
@@ -325,7 +329,7 @@ async def create_unit(body: UnitCreate, _: dict = Depends(require_role("owner"))
 
 
 @router.patch("/units/{unit_id}")
-async def update_unit(unit_id: str, body: UnitUpdate, _: dict = Depends(require_role("owner"))):
+async def update_unit(unit_id: str, body: UnitUpdate, _: dict = Depends(require_role("owner", "operator"))):
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
@@ -338,7 +342,7 @@ async def update_unit(unit_id: str, body: UnitUpdate, _: dict = Depends(require_
 
 
 @router.delete("/units/{unit_id}")
-async def delete_unit(unit_id: str, _: dict = Depends(require_role("owner"))):
+async def delete_unit(unit_id: str, _: dict = Depends(require_role("owner", "operator"))):
     supabase.table("prop_units").delete().eq("id", unit_id).execute()
     return {"id": unit_id, "deleted": True}
 
@@ -351,7 +355,7 @@ def _split_room_body(body_dict: dict) -> tuple[dict, dict]:
 
 
 @router.post("/rooms")
-async def create_room(body: RoomCreate, _: dict = Depends(require_role("owner"))):
+async def create_room(body: RoomCreate, _: dict = Depends(require_role("owner", "operator"))):
     u = (
         supabase.table("prop_units")
         .select("id")
@@ -382,7 +386,7 @@ async def create_room(body: RoomCreate, _: dict = Depends(require_role("owner"))
 
 
 @router.patch("/rooms/{room_id}")
-async def update_room(room_id: str, body: RoomUpdate, _: dict = Depends(require_role("owner"))):
+async def update_room(room_id: str, body: RoomUpdate, _: dict = Depends(require_role("owner", "operator"))):
     body_dict = body.model_dump()
     structural, financial = _split_room_body(body_dict)
     if not structural and not financial:
@@ -426,7 +430,7 @@ async def update_room(room_id: str, body: RoomUpdate, _: dict = Depends(require_
 
 
 @router.delete("/rooms/{room_id}")
-async def delete_room(room_id: str, _: dict = Depends(require_role("owner"))):
+async def delete_room(room_id: str, _: dict = Depends(require_role("owner", "operator"))):
     supabase.table("prop_rooms").delete().eq("id", room_id).execute()
     return {"id": room_id, "deleted": True}
 
@@ -453,7 +457,7 @@ async def list_monthly_perf(
 @router.post("/monthly-performance")
 async def create_monthly_perf(
     body: MonthlyPerfCreate,
-    _: dict = Depends(require_role("owner")),
+    _: dict = Depends(require_role("owner", "operator")),
 ):
     payload = {k: v for k, v in body.model_dump().items() if v is not None}
     try:
@@ -469,7 +473,7 @@ async def create_monthly_perf(
 async def update_monthly_perf(
     row_id: str,
     body: MonthlyPerfUpdate,
-    _: dict = Depends(require_role("owner")),
+    _: dict = Depends(require_role("owner", "operator")),
 ):
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     if not updates:
@@ -486,6 +490,6 @@ async def update_monthly_perf(
 
 
 @router.delete("/monthly-performance/{row_id}")
-async def delete_monthly_perf(row_id: str, _: dict = Depends(require_role("owner"))):
+async def delete_monthly_perf(row_id: str, _: dict = Depends(require_role("owner", "operator"))):
     supabase.table("prop_monthly_performance").delete().eq("id", row_id).execute()
     return {"id": row_id, "deleted": True}
